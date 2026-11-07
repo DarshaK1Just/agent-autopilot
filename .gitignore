@@ -2,3 +2,5 @@ runs/
 __pycache__/
 *.pyc
 .venv/
+controller_state.db*
+reports/*.tmp
