@@ -758,4 +758,6 @@ def test_one_noisy_caller_id_with_little_data_is_ignored(store):
     from controller.planner import plan_caller_id
     cur = {"D1": 0.42, "D2": 0.42, "D3": 0.08, "D4": 0.08}
     ctx = _did_ctx(store, {"D1": (3000, 780), "D2": (60, 5)}, cur)  # D2 looks terrible, but on 60 dials
-    assert plan_caller_id(ctx, -10**9) == []
+    for intent in plan_caller_id(ctx, -10**9):
+        assert intent.evidence["bad"] == []  # thin data is "unmeasured" (held at the probe share), never "degraded"
+        assert min(intent.patch["allocations"]["default"]["caller_id"].values()) >= POL.did_probe_share - 1e-9
