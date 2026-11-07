@@ -171,14 +171,34 @@ def guardrail_ok(ctx: WfCtx, counts: dict, opt: str, ctl: str) -> tuple[bool, di
                                                    "p_within_tolerance": round(p_ok, 3), "max_drop": drop}
 
 
+def lift_bar(pol: Policy, rate: float) -> float:
+    """Practical lift worth acting on: relative to the control rate, but never below an absolute floor."""
+    return max(pol.min_relative_lift * rate, pol.min_absolute_lift)
+
+
+def harm_bar(pol: Policy, rate: float) -> float:
+    return max(pol.harm_relative_drop * rate, pol.min_absolute_lift * pol.harm_relative_drop / pol.min_relative_lift)
+
+
+def enough_events(pol: Policy, c: stats.Contrast) -> bool:
+    """The normal approximation needs events of both kinds in both arms (matters near 0% and 100%)."""
+    return min(c.rate_arm * c.n_arm, (1 - c.rate_arm) * c.n_arm, c.rate_ctl * c.n_ctl, (1 - c.rate_ctl) * c.n_ctl) >= pol.min_events
+
+
 def _contrast_row(c: stats.Contrast) -> dict:
     return {"diff": round(c.diff, 4), "sd": round(c.sd, 4), "rate_arm": round(c.rate_arm, 4),
             "rate_ctl": round(c.rate_ctl, 4), "n_arm": c.n_arm, "n_ctl": c.n_ctl}
 
 
 # --------------------------------------------------------------------------------------- experiments
+def _dropped(ctx: WfCtx, st: dict) -> set:
+    """Options stopped as harmful that are still inside the retirement period (the evidence expires: one noisy opening
+    must not exile a good arm for good)."""
+    return {o for o, m in st["dropped"].items() if m + ctx.pol.retire_minutes > ctx.minute}
+
+
 def plan_lever(ctx: WfCtx, dim: str, held: bool) -> list[Intent]:
-    """Explore -> evidence -> controlled promotion -> decay watch, for one lever (welcome_message or voice)."""
+    """Explore -> provisional winner -> confirmation on fresh data -> promotion -> decay watch, for one lever."""
     opts = ctx.spec["options"][dim]
     if len(opts) < 2 or ctx.primary != "engagement_rate" or held:
         return []
@@ -186,26 +206,37 @@ def plan_lever(ctx: WfCtx, dim: str, held: bool) -> list[Intent]:
     cur_def = cfgutil.dist(ctx.cfg, "default", dim)
     scopes = st["scopes"]
     ds = scopes.get("default")
-    # a supervisor (or anyone) rewrote the allocation under a running experiment -> restart from reality
-    if ds and ds["phase"] in ("EXPLORING", "CONFIRMING") and len(_kdist(cur_def)) < 2:
-        return [Intent(ctx.okey("reset", dim, ctx.version), "exp_reset", ctx.wf, (), {}, f"{dim}: experiment reset",
-                       "allocation changed externally; experiment assumptions invalid",
-                       {"allocation": cur_def}, exp_update={"dims": {dim: {"scopes": {"default": None}}}})]
+    if ds:
+        start = ds["start_ver"] if isinstance(ds.get("start_ver"), int) else 0
+        edited = ctx.store.one("SELECT 1 FROM config_versions WHERE wf=? AND version>? AND actor='supervisor' AND changed_dims LIKE ?",
+                               (ctx.wf, start, f'%"{dim}"%'))
+        # the lever was rewritten under the experiment (by a supervisor, or to fewer than two options): its control and
+        # arms no longer mean what the evidence assumed -> start again from the live allocation
+        if edited or (ds["phase"] in ("EXPLORING", "CONFIRMING") and len(_kdist(cur_def)) < 2):
+            return [Intent(ctx.okey("reset", dim, ctx.version), "exp_reset", ctx.wf, (), {}, f"{dim}: experiment reset",
+                           "allocation changed externally; experiment assumptions invalid",
+                           {"allocation": cur_def, "supervisor_edit": bool(edited)},
+                           exp_update={"dims": {dim: {"scopes": {"default": None}}}})]
     if ds is None:
         return _start_explore(ctx, dim, st, cur_def)
+    out: list[Intent] = []
     if ds["phase"] == "EXPLORING":
-        return _evaluate_exploring(ctx, dim, st)
-    if ds["phase"] == "CONFIRMING":
-        return _confirm(ctx, dim, st)
-    if ds["phase"] == "PROMOTED":
-        return _watch_decay(ctx, dim, st)
-    return []
+        out += _evaluate_exploring(ctx, dim, st)
+    elif ds["phase"] == "CONFIRMING":
+        out += _confirm(ctx, dim, st, "default")
+    cohort_ids = {c["id"] for c in ctx.cfg["cohorts"]}
+    for scope, s in scopes.items():
+        if scope != "default" and s.get("phase") == "CONFIRMING" and scope in cohort_ids:
+            out += _confirm(ctx, dim, st, scope)
+    if any(s.get("phase") == "PROMOTED" for s in scopes.values()):
+        out += _watch_decay(ctx, dim, st)
+    return out
 
 
 def _start_explore(ctx: WfCtx, dim: str, st: dict, cur_def: dict) -> list[Intent]:
     pol = ctx.pol
     ctl = cfgutil.modal(cur_def)
-    opts = [o for o in ctx.spec["options"][dim] if o == ctl or o not in st["dropped"]]
+    opts = [o for o in ctx.spec["options"][dim] if o == ctl or o not in _dropped(ctx, st)]
     k = len(opts)
     if k < 2:
         return []
@@ -240,10 +271,10 @@ def _decide(ctx: WfCtx, counts: dict, opts: list[str], ctl: str, retired: dict):
     rows, win, harm = {}, [], []
     for o in arms:
         c = ev.stratified(counts, o, ctl, ctx.primary, prior)
-        if c is None or min(c.n_arm, c.n_ctl) < pol.min_trials_arm:
+        if c is None or min(c.n_arm, c.n_ctl) < pol.min_trials_arm or not enough_events(pol, c):
             rows[o] = {"status": "insufficient", "n_arm": c.n_arm if c else 0, "n_ctl": c.n_ctl if c else 0}
             continue
-        dmin, dh = pol.min_relative_lift * c.rate_ctl, pol.harm_relative_drop * c.rate_ctl
+        dmin, dh = lift_bar(pol, c.rate_ctl), harm_bar(pol, c.rate_ctl)
         p_win, p_harm = c.p_greater(dmin), 1.0 - c.p_greater(-dh)
         row = {**_contrast_row(c), "p_lift_gt_min": round(p_win, 4), "p_harm": round(p_harm, 4), "need": round(need, 4)}
         if p_harm >= pol.harm_confidence:
@@ -265,9 +296,11 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
     pol, opts = ctx.pol, ctx.spec["options"][dim]
     ds = st["scopes"]["default"]
     ctl = ds["control"]
+    dropped = _dropped(ctx, st)
     counts = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=ds["start_ver"], cohs=["default"])
-    rows, win, harm = _decide(ctx, counts, [o for o in opts if o not in st["dropped"]], ctl, st["retired"])
+    rows, win, harm = _decide(ctx, counts, [o for o in opts if o not in dropped], ctl, st["retired"])
     cur = cfgutil.dist(ctx.cfg, "default", dim)
+    _note_evidence(ctx, dim, st, rows, bool(win or harm))
     patch: dict = {"allocations": {}}
     upd_scopes: dict = {}
     cohorts_add: dict = {}
@@ -280,7 +313,7 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         # Full promotion happens only after fresh post-promotion data confirms it (see _confirm).
         w = win[0][1]
         a0 = w
-        live = [o for o in opts if o not in (w, ctl) and o not in harm and o not in st["dropped"]]
+        live = [o for o in opts if o not in (w, ctl) and o not in harm and o not in dropped]
         rest = 1 - pol.provisional_share
         prov = {w: pol.provisional_share, ctl: rest / 2, **{o: rest / 2 / len(live) for o in live}} if live else {w: 1 - rest / 2, ctl: rest / 2}
         patch["allocations"]["default"] = {dim: cfgutil.clean_dist(prov)}
@@ -292,13 +325,18 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         if len(target) >= 2 and cfgutil.tv(cur, target) > 0.02:
             patch["allocations"]["default"] = {dim: target}
             kinds.append("harm_stop")
-    c_int = _cohort_candidates(ctx, dim, st, ds, a0, set(harm) | set(st["dropped"]))
+    else:
+        back = [o for o in opts if o not in cur and o not in dropped and o != ctl]
+        if back:  # earlier harm evidence has expired: offer the arm again (a noisy opening is not a verdict)
+            patch["allocations"]["default"] = {dim: explore_dist([o for o in opts if o not in dropped], ctl, pol.explore_control_share)}
+            kinds.append("reintroduce")
+    c_int = _cohort_candidates(ctx, dim, st, ds, a0, set(harm) | dropped)
     if c_int:
         patch["cohorts_add"] = [{"id": cid, "where": w} for cid, (w, _, _) in c_int.items()]
         for cid, (w, dist, evd) in c_int.items():
             patch["allocations"].setdefault(cid, {})[dim] = dist
             cohorts_add[cid] = (w, evd)
-            upd_scopes[cid] = {"phase": "PROMOTED", "winner": cfgutil.modal(dist), "control": ctl, "start_ver": "$V",
+            upd_scopes[cid] = {"phase": "CONFIRMING", "winner": evd["best"], "control": evd["hold"], "start_ver": "$V",
                                "promo_minute": ctx.minute, "promo_lift": max(evd["diff"], 0)}
         kinds.append("cohort")
     if not kinds:
@@ -318,7 +356,9 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
     if "harm_stop" in kinds:
         summary_bits.append(f"Stop harmful {dim} options {harm}")
     if "cohort" in kinds:
-        summary_bits.append(f"Tailor {dim} for cohorts {', '.join(cohorts_add)}")
+        summary_bits.append(f"Provisionally tailor {dim} for cohorts {', '.join(cohorts_add)} (to be confirmed on fresh data)")
+    if "reintroduce" in kinds:
+        summary_bits.append(f"Offer {dim} options {[o for o in opts if o not in cur and o not in dropped and o != ctl]} again (earlier harm evidence expired)")
     conf = rows[a0]["p_lift_gt_min"] if win else max([e[2]["p_win"] for e in c_int.values()] or [0.5])
     return [Intent(ctx.okey("+".join(kinds), dim, patch, ds["start_ver"]), "+".join(kinds), ctx.wf, (dim,) if patch else (),
                    patch, "; ".join(summary_bits),
@@ -327,43 +367,106 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
                    {**dims_note, "cohorts": {c: e for c, (_, _, e) in c_int.items()}},
                    expected_rel_lift=lift if lift else max([e[2]["diff"] / max(ctx.prior, 1e-6) for e in c_int.values()] or [0]),
                    pop_share=1.0 if win else sum(e[2]["share"] for e in c_int.values()), confidence=conf,
-                   protective=("promote" not in kinds and "cohort" not in kinds), urgent=("harm_stop" in kinds),
+                   protective=(set(kinds) == {"harm_stop"}), urgent=(set(kinds) == {"harm_stop"}),
                    exp_update={"dims": {dim: {"scopes": upd_scopes,
                                               "dropped": {o: ctx.minute for o in harm if "harm_stop" in kinds}}},
                                "cohorts_add": cohorts_add}, dry_run=dry)]
 
 
-def _confirm(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
-    """Second, independent look at a provisional winner using only data collected since the provisional split."""
-    pol, opts = ctx.pol, ctx.spec["options"][dim]
-    ds = st["scopes"]["default"]
-    w, ctl = ds["winner"], ds["control"]
-    counts = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=ds["start_ver"], cohs=["default"])
+def _note_evidence(ctx: WfCtx, dim: str, st: dict, rows: dict, decided: bool):
+    """Say what the evidence supports. 'No winner yet' is not 'no effect': INSUFFICIENT means unknown."""
+    pol = ctx.pol
+    if any(r["status"] == "insufficient" for r in rows.values()) or not rows:
+        label = "INSUFFICIENT"
+    elif decided:
+        label = "DECIDED"
+    elif all(r["p_lift_gt_min"] <= pol.decay_p for r in rows.values()):
+        label = "NO_PRACTICAL_EFFECT"   # every challenger has been measured and credibly does not clear the bar
+    else:
+        label = "UNDECIDED"
+    n = [min(r.get("n_arm", 0), r.get("n_ctl", 0)) for r in rows.values()]
+    st["evidence"] = {"label": label, "minute": ctx.minute, "min_trials_seen": min(n) if n else 0, "min_trials_needed": pol.min_trials_arm}
+    save_exp(ctx.store, ctx.wf, dim, st)
+
+
+def _guard_breach(ctx: WfCtx, counts: dict, w: str, ctl: str, confidence: float, min_trials: int):
+    gname, drop = ctx.guardrail
+    g = ev.stratified(counts, w, ctl, gname, ev.baseline_rate(ctx.store, ctx.wf, gname))
+    if g is None or min(g.n_arm, g.n_ctl) < min_trials:
+        return False, None
+    p = 1.0 - g.p_greater(-drop)
+    return p >= confidence, {"guardrail": gname, "diff": round(g.diff, 4), "p_beyond_tolerance": round(p, 3), "max_drop": drop}
+
+
+def _severe(ctx: WfCtx, counts: dict, w: str, ctl: str):
+    """Safety path: is the arm credibly far below its control (or does it collapse the guardrail)? Needs a large effect,
+    so it can act on less data than the optimisation path without being noisier."""
+    pol = ctx.pol
     c = ev.stratified(counts, w, ctl, ctx.primary, ctx.prior)
-    if c is None or min(c.n_arm, c.n_ctl) < pol.min_trials_arm:
+    if c is not None and min(c.n_arm, c.n_ctl) >= pol.severe_min_trials and enough_events(pol, c):
+        bar = max(pol.severe_relative_drop * c.rate_ctl, harm_bar(pol, c.rate_ctl))
+        p = 1.0 - c.p_greater(-bar)
+        if p >= pol.severe_confidence:
+            return True, {"severe_primary": _contrast_row(c), "p_beyond_severe_bar": round(p, 4)}
+    hit, g = _guard_breach(ctx, counts, w, ctl, pol.severe_confidence, pol.severe_min_trials)
+    return (True, {"severe_guardrail": g}) if hit else (False, None)
+
+
+def _withdraw_patch(ctx: WfCtx, dim: str, st: dict, scope: str, w: str, ctl: str):
+    """Allocation patch + state update that take a withdrawn/rolled-back arm out of one scope."""
+    pol, opts = ctx.pol, ctx.spec["options"][dim]
+    if scope == "default":
+        live = [o for o in opts if o != w and o not in _dropped(ctx, st)]
+        target = explore_dist(live, ctl, pol.explore_control_share) if len(live) >= 2 else {ctl: 1.0}
+        return ({"allocations": {"default": {dim: target}}}, {"phase": "EXPLORING", "control": ctl, "start_ver": "$V"}, {})
+    patch = {"allocations": {scope: {dim: None}}}
+    others = [d for d in (ctx.cfg["allocations"].get(scope) or {}) if d != dim]
+    sched = (ctx.cfg["schedule"]["hour_weights"].get(scope) is not None)
+    if not others and not sched:
+        patch["cohorts_remove"] = [scope]   # a cohort with no remaining purpose is not kept (it would only fragment traffic)
+    return (patch, None, {"cohorts_remove": patch.get("cohorts_remove", [])})
+
+
+def _confirm(ctx: WfCtx, dim: str, st: dict, scope: str = "default") -> list[Intent]:
+    """Second, independent look at a provisional winner using only data collected since the provisional split.
+    Applies to the workflow-level winner and to cohort overrides alike: any arm chosen as the best of several noisy
+    alternatives is confirmed on fresh data before it gets the full split."""
+    pol = ctx.pol
+    s = st["scopes"][scope]
+    w, ctl = s["winner"], s["control"]
+    cur = cfgutil.eff(ctx.cfg, scope, dim)
+    if w not in cur or ctl not in cur:
         return []
-    p_pos, p_bar = c.p_greater(0.0), c.p_greater(pol.min_relative_lift * c.rate_ctl)
-    evd = {"fresh": _contrast_row(c), "p_better_than_control": round(p_pos, 4), "p_clears_practical_lift": round(p_bar, 4),
-           "first_look_lift": ds.get("promo_lift"), "confirm_prob": pol.confirm_prob}
-    ok, g = guardrail_ok(ctx, counts, w, ctl)
-    if p_pos >= pol.confirm_prob and ok:
+    counts = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=s["start_ver"], cohs=[scope])
+    severe, sev_evd = _severe(ctx, counts, w, ctl)
+    c = ev.stratified(counts, w, ctl, ctx.primary, ctx.prior)
+    enough = c is not None and min(c.n_arm, c.n_ctl) >= pol.min_trials_arm and enough_events(pol, c)
+    if not enough and not severe:
+        return []
+    p_pos = c.p_greater(0.0) if c else 0.0
+    evd = {"scope": scope, "fresh": _contrast_row(c) if c else None, "p_better_than_control": round(p_pos, 4),
+           "first_look_lift": s.get("promo_lift"), "confirm_prob": pol.confirm_prob, **(sev_evd or {})}
+    ok, g = guardrail_ok(ctx, counts, w, ctl) if enough else (False, None)
+    if enough and not severe and p_pos >= pol.confirm_prob and ok:
         target = cfgutil.clean_dist({w: 1 - pol.holdout_share, ctl: pol.holdout_share})
-        return [Intent(ctx.okey("confirm", dim, w), "confirm", ctx.wf, (dim,), {"allocations": {"default": {dim: target}}},
-                       f"Confirm {dim} {w}: fresh data +{c.diff:.3f} abs {ctx.primary} (first look +{ds.get('promo_lift', 0):.3f})",
-                       "The provisional winner still beats the control on data collected after it was chosen; moving to a "
+        return [Intent(ctx.okey("confirm", dim, w, scope), "confirm", ctx.wf, (dim,), {"allocations": {scope: {dim: target}}},
+                       f"Confirm {dim} {w} for {scope}: fresh data +{c.diff:.3f} abs {ctx.primary} (first look +{s.get('promo_lift', 0):.3f})",
+                       "The provisional winner still beats its control on data collected after it was chosen; moving to a "
                        f"{1 - pol.holdout_share:.0%}/{pol.holdout_share:.0%} split with the control as holdout.",
                        {**evd, "guardrail": g}, expected_rel_lift=c.diff / max(c.rate_ctl, 1e-6), confidence=p_pos,
-                       dry_run=replay(counts, ["default"], ctx.primary, cfgutil.dist(ctx.cfg, "default", dim), target, ctl, ctx.prior),
-                       exp_update={"dims": {dim: {"scopes": {"default": {"phase": "PROMOTED", "start_ver": "$V"}}}}})]
-    if p_pos <= 1 - pol.confirm_prob:  # symmetric with confirmation: withdraw only on equally strong evidence against
-        live = [o for o in opts if o != w and o not in st["dropped"]]
-        target = explore_dist(live, ctl, pol.explore_control_share) if len(live) >= 2 else {ctl: 1.0}
-        return [Intent(ctx.okey("unconfirmed", dim, w), "unconfirmed", ctx.wf, (dim,), {"allocations": {"default": {dim: target}}},
-                       f"Withdraw provisional {dim} {w}: fresh data does not support the first-look lift",
-                       f"Fresh lift {c.diff:+.3f}; P(better than control) {p_pos:.2f}. The first-look estimate was selection-biased; "
-                       "back to exploring the remaining options.", evd, protective=True, urgent=True, confidence=0.8,
-                       exp_update={"dims": {dim: {"scopes": {"default": {"phase": "EXPLORING", "control": ctl, "start_ver": "$V"}},
-                                                  "retired": {w: ctx.minute}}}})]
+                       dry_run=replay(counts, [scope], ctx.primary, cur, target, ctl, ctx.prior),
+                       exp_update={"dims": {dim: {"scopes": {scope: {"phase": "PROMOTED", "start_ver": "$V"}}}}})]
+    if severe or (enough and p_pos <= 1 - pol.confirm_prob):  # symmetric with confirmation (or a regression)
+        patch, new_state, extra = _withdraw_patch(ctx, dim, st, scope, w, ctl)
+        upd = {"dims": {dim: {"scopes": {scope: new_state}, **({"retired": {w: ctx.minute}} if scope == "default" else {})}}}
+        if extra.get("cohorts_remove"):
+            upd["cohorts_remove"] = extra["cohorts_remove"]
+        why = "severe regression against its control" if severe else "fresh data does not support the first-look lift"
+        return [Intent(ctx.okey("unconfirmed", dim, w, scope), "unconfirmed", ctx.wf, (dim,), patch,
+                       f"Withdraw provisional {dim} {w} for {scope}: {why}",
+                       f"Fresh lift {c.diff:+.3f}" + (f"; P(better than control) {p_pos:.2f}" if c else "") +
+                       ". The first-look estimate was selection-biased; falling back.", evd, protective=True, urgent=True, confidence=0.8,
+                       exp_update=upd)]
     return []
 
 
@@ -403,7 +506,7 @@ def _cohort_candidates(ctx: WfCtx, dim: str, st: dict, ds: dict, a0: str, bad_op
     need = 1.0 - pol.tail_prob / len(cands)
     best: dict = {}
     for F, v, o, c, share in cands:
-        p_win = c.p_greater(pol.min_relative_lift * c.rate_ctl)
+        p_win = c.p_greater(lift_bar(pol, c.rate_ctl))
         if p_win >= need and c.diff >= pol.min_cohort_gain and ((F, v) not in best or c.diff > best[(F, v)][3].diff):
             best[(F, v)] = (F, v, o, c, share, p_win)
     if not best:
@@ -418,59 +521,76 @@ def _cohort_candidates(ctx: WfCtx, dim: str, st: dict, ds: dict, a0: str, bad_op
     chosen = sorted((x for (f, _), x in best.items() if f == F), key=lambda x: -x[3].diff)[: pol.max_cohorts - len(existing)]
     for _, v, o, c, share, p_win in chosen:
         hold = a0 if a0 != o else ctl
-        out[f"{F}={v}"] = ({F: [v]}, cfgutil.clean_dist({o: 1 - pol.holdout_share, hold: pol.holdout_share}),
-                           {"feature": F, "value": v, "best": o, "vs": a0, "diff": round(c.diff, 4), "p_win": round(p_win, 4),
+        out[f"{F}={v}"] = ({F: [v]}, cfgutil.clean_dist({o: pol.provisional_share, hold: 1 - pol.provisional_share}),
+                           {"feature": F, "value": v, "best": o, "vs": a0, "hold": hold, "diff": round(c.diff, 4), "p_win": round(p_win, 4),
                             "share": round(share, 3), "candidates_examined": len(cands), "bonferroni_need": round(need, 4),
                             "raw": _contrast_row(c)})
     return out
 
 
+def _trailing_counts(ctx: WfCtx, dim: str, scope: str, start_ver: int, blocks: int) -> dict:
+    return ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=start_ver, min_blk=ctx.blk_now - blocks + 1, cohs=[scope])
+
+
 def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
-    """Compare each promoted winner against its holdout over a rolling window; roll back when it stops winning."""
-    pol, opts = ctx.pol, ctx.spec["options"][dim]
+    """Compare each promoted winner with its holdout and roll it back when it stops winning.
+    Two paths: SAFETY (a large drop or a collapsed guardrail, acted on within hours and ~100 trials) and DECAY (the arm no
+    longer clears the practical bar; judged on the smallest trailing window that holds at least one full day and the same
+    sample a promotion needs, so busy workflows react in a day and quiet ones wait for the evidence)."""
+    pol = ctx.pol
     out_patch: dict = {"allocations": {}}
     upd: dict = {}
-    reasons, evd = [], {}
+    reasons, evd, removed, retired = [], {}, [], {}
+    cohort_ids = {c["id"] for c in ctx.cfg["cohorts"]}
     for scope, s in st["scopes"].items():
-        if s.get("phase") != "PROMOTED" or s["winner"] == s["control"]:
-            continue
-        if scope != "default" and scope not in {c["id"] for c in ctx.cfg["cohorts"]}:
+        if s.get("phase") != "PROMOTED" or s["winner"] == s["control"] or (scope != "default" and scope not in cohort_ids):
             continue
         w, ctl = s["winner"], s["control"]
         cur = cfgutil.eff(ctx.cfg, scope, dim)
         if w not in cur or ctl not in cur:
             continue
         first = ctx.store.one("SELECT MIN(blk) b FROM agg WHERE wf=? AND dim=? AND coh=? AND ver>=?", (ctx.wf, dim, scope, s["start_ver"]))["b"]
-        if first is None or ctx.blk_now - first < pol.decay_window_blocks:
-            continue  # the decay test is defined over a full window of post-promotion data
-        recent = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=s["start_ver"], min_blk=ctx.blk_now - pol.decay_window_blocks, cohs=[scope])
-        whole = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=s["start_ver"], cohs=[scope])
-        cr, cw = ev.stratified(recent, w, ctl, ctx.primary, ctx.prior), ev.stratified(whole, w, ctl, ctx.primary, ctx.prior)
-        if cr is None or min(cr.n_arm, cr.n_ctl) < pol.min_trials_arm:
-            continue  # a demotion needs at least the sample a promotion needs; otherwise promote/demote can flap on noise
-        # A promoted arm must keep clearing the bar it was promoted on (practical lift over its own holdout). The lift
-        # measured at promotion is not used: it is a maximum over noisy arms and biased upward.
-        p_still = cr.p_greater(pol.min_relative_lift * cr.rate_ctl)
-        p_harm = 1.0 - (cw.p_greater(-pol.harm_relative_drop * cw.rate_ctl) if cw else 1.0)
-        evd[scope] = {"recent": _contrast_row(cr), "p_still_clears_practical_lift": round(p_still, 3),
-                      "whole": _contrast_row(cw) if cw else None, "window_blocks": pol.decay_window_blocks}
-        if p_still <= pol.decay_p or p_harm >= pol.harm_confidence:
-            others = [o for o in opts if o not in (w, ctl) and o not in st['dropped']]
+        if first is None:
+            continue
+        age = ctx.blk_now - first + 1
+        severe, sev_evd = _severe(ctx, _trailing_counts(ctx, dim, scope, s["start_ver"], min(2, age)), w, ctl)
+        why, detail = ("severe regression", sev_evd) if severe else (None, None)
+        if not severe:
+            for k in sorted({k for k in (4, 6, 8, 12, 16, 24, 32, 48, 64, 96, age) if pol.decay_min_blocks <= k <= age}):
+                counts = _trailing_counts(ctx, dim, scope, s["start_ver"], k)
+                cr = ev.stratified(counts, w, ctl, ctx.primary, ctx.prior)
+                if cr is None or min(cr.n_arm, cr.n_ctl) < pol.min_trials_arm or not enough_events(pol, cr):
+                    continue
+                p_still = cr.p_greater(lift_bar(pol, cr.rate_ctl))
+                p_harm = 1.0 - cr.p_greater(-harm_bar(pol, cr.rate_ctl))
+                breach, gd = _guard_breach(ctx, counts, w, ctl, pol.harm_confidence, pol.min_trials_arm)
+                detail = {"window_blocks": k, "recent": _contrast_row(cr), "p_still_clears_practical_lift": round(p_still, 3),
+                          "p_harmful": round(p_harm, 3), "guardrail": gd}
+                if p_harm >= pol.harm_confidence:
+                    why = "credibly harmful"
+                elif breach:
+                    why = "guardrail breached"
+                elif p_still <= pol.decay_p:
+                    why = f"no longer clears the practical bar (P={p_still:.2f})"
+                break
+        evd[scope] = detail
+        if why:
+            patch, new_state, extra = _withdraw_patch(ctx, dim, st, scope, w, ctl)
+            out_patch["allocations"].update(patch["allocations"])
+            removed += patch.get("cohorts_remove", [])
+            upd[scope] = new_state
             if scope == "default":
-                target = cfgutil.clean_dist({ctl: 0.7, **{o: 0.3 / len(others) for o in others}}) if others else {ctl: 1.0}
-                out_patch["allocations"]["default"] = {dim: target}
-                upd[scope] = {"phase": "EXPLORING", "control": ctl, "start_ver": "$V"}
-            else:
-                out_patch["allocations"][scope] = {dim: None}
-                upd[scope] = None
-            reasons.append(f"{dim}={w} in {scope}: recent lift {cr.diff:+.3f} (P still clears the {pol.min_relative_lift:.0%} practical bar: {p_still:.2f})")
+                retired[w] = ctx.minute
+            reasons.append(f"{dim}={w} in {scope}: {why}")
     if not reasons:
         return []
+    if removed:
+        out_patch["cohorts_remove"] = removed
     return [Intent(ctx.okey("rollback", dim, sorted(upd)), "rollback", ctx.wf, (dim,), out_patch,
-                   "Roll back decayed winner: " + "; ".join(reasons),
-                   "Winner no longer beats its holdout over the recent window; reverting to the control and re-exploring.",
+                   "Roll back: " + "; ".join(reasons),
+                   "A promoted arm stopped beating its holdout (or regressed); reverting to the control and re-exploring.",
                    evd, protective=True, urgent=True, confidence=0.8, expected_rel_lift=0.02,
-                   exp_update={"dims": {dim: {"scopes": upd, "retired": {s_["winner"]: ctx.minute for sc, s_ in st["scopes"].items() if sc in upd}}}})]
+                   exp_update={"dims": {dim: {"scopes": upd, "retired": retired}}, **({"cohorts_remove": removed} if removed else {})})]
 
 
 # --------------------------------------------------------------------------------------- caller id

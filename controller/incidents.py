@@ -55,6 +55,19 @@ class Incidents:
         r = self.s.one(sql, args)
         return (r["k"] or 0), (r["n"] or 0)
 
+    def _baseline(self, wf: str, since: int, blk_now: int) -> tuple[int, int]:
+        """Flag rate before the current prompt: trailing 7 days (so slow drift is followed), excluding periods that were
+        themselves incidents (so an old incident cannot teach the detector that a bad rate is normal). Falls back to all
+        earlier clean history when the trailing window is too thin."""
+        sql = ("SELECT SUM(conn) n, SUM(flagged) k FROM qa WHERE wf=? AND ver<? AND blk>=? AND NOT EXISTS ("
+               "SELECT 1 FROM incidents i WHERE i.wf=qa.wf AND json_extract(i.data,'$.bad_prompt')=qa.prompt "
+               "AND qa.ver >= json_extract(i.data,'$.since_version'))")
+        for lo in (blk_now - 28, -10**9):
+            r = self.s.one(sql, (wf, since, lo))
+            if (r["n"] or 0) >= 400:
+                return r["k"] or 0, r["n"]
+        return r["k"] or 0, r["n"] or 0
+
     def check(self, ctx: WfCtx) -> dict | None:
         """Open an incident if the flag rate is credibly and materially above baseline on a population of calls."""
         pol = self.pol
@@ -62,7 +75,7 @@ class Incidents:
             return None
         cur, since = self._prompt_since(ctx)
         k, n = self._flag_rate(ctx.wf, cur, since)
-        kb, nb = self._flag_rate(ctx.wf, None, 0, since)
+        kb, nb = self._baseline(ctx.wf, since, ctx.blk_now)
         b0 = kb / nb if nb >= 400 else 0.012
         if n < pol.inc_min_conn or k < pol.inc_min_flags:
             self.s.put(f"inc_hit:{ctx.wf}", None)

@@ -98,6 +98,10 @@ class Ingestor:
         if meta["last_event_id"] <= last_eid and kind == "events":
             self.store.put(f"cur_{kind}", meta["chunk"])
             return {"skipped": True}
+        if kind == "events" and last_eid and meta.get("first_event_id", 0) > last_eid + 1:
+            # The contract gives strictly increasing event ids and ordered chunks; a hole means a chunk we never saw.
+            self.store.audit("ingest_gap", f"events {last_eid + 1}..{meta['first_event_id'] - 1} are missing before chunk {meta['chunk']}",
+                             detail={"last_committed": last_eid, "chunk_first": meta["first_event_id"]})
         n_ev = 0
         stream = iter(self.client.stream_chunk(meta["chunk"]))
         with self.store.tx():

@@ -63,7 +63,7 @@ def explain(db, wf: str, at: int):
     planned = db.execute("SELECT detail FROM audit WHERE proposal_id=? AND kind='proposal_planned'", (pid,)).fetchone()
     if planned:
         th = j(planned["detail"]).get("thresholds", {})
-        keep = ("tail_prob", "min_relative_lift", "harm_relative_drop", "min_trials_arm", "confirm_prob", "holdout_share", "provisional_share")
+        keep = ("tail_prob", "min_relative_lift", "min_absolute_lift", "harm_relative_drop", "min_trials_arm", "confirm_prob", "holdout_share", "provisional_share")
         print("  THRESHOLDS:", ", ".join(f"{k}={th[k]}" for k in keep if k in th))
     ev = body.get("evidence") or {}
     for key, e in (ev.get("intents") or {}).items():
@@ -92,6 +92,9 @@ def supervisor(db):
         wf, spec = w["wf"], j(w["spec"])
         print(f"\n## {wf}  (primary {spec['objective']['primary']}, guardrail {spec['objective']['guardrail']})")
         for e in db.execute("SELECT * FROM experiments WHERE wf=?", (wf,)):
+            ev_ = j(e["state"]).get("evidence")
+            if ev_:
+                print(f"   EVIDENCE {e['dim']:<16} {ev_['label']} (smallest arm has {ev_['min_trials_seen']} of {ev_['min_trials_needed']} trials needed)")
             for scope, s in j(e["state"])["scopes"].items():
                 win = f" winner={s.get('winner')}" if s.get("winner") else ""
                 print(f"   TESTING {e['dim']:<16} scope={scope:<16} phase={s['phase']}{win} control={s['control']}")

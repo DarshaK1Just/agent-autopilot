@@ -13,6 +13,11 @@ class Policy:
     min_trials_arm: int = 250              # D: heuristic floor against very early posterior noise and approval churn (not a power derivation)
     min_relative_lift: float = 0.03            # B: RELATIVE lift over control (3% of the control rate: 1.5 points at a 50% rate)
     harm_relative_drop: float = 0.02           # B: RELATIVE drop (2% of the control rate) that counts as harm
+    min_absolute_lift: float = 0.005           # B: ...but never less than 0.5 points: at a 1% rate "3% relative" would be 0.03 points of nothing
+    min_events: int = 10                       # C: successes AND failures needed in each arm for the normal approximation to be usable
+    severe_relative_drop: float = 0.10         # B: a promoted arm 10% (relative) below its holdout is a regression, not a decay
+    severe_confidence: float = 0.99            # D: safety path: fast, but only on strong evidence
+    severe_min_trials: int = 100               # D: smaller sample allowed on the safety path because the effect required is large
     harm_confidence: float = 0.95          # C: 1 - alpha
     tail_prob: float = 0.05                    # D: Bayesian: tolerated posterior tail probability, split by Bonferroni over the comparisons made at one look. Not a classical error guarantee: see reports/false_winner_rate.md for the measured behaviour under repeated looks
     guardrail_confidence: float = 0.80     # D: block only when there is >= 20% posterior chance the guardrail breaches its tolerance
@@ -20,7 +25,7 @@ class Policy:
     min_cohort_share: float = 0.08         # D: a cohort must cover >= 8% of traffic ...
     min_cohort_gain: float = 0.004         # D: ... and add >= 0.4pt absolute KPI
     max_cohorts: int = 6                   # D
-    decay_window_blocks: int = 6           # D: 36h window (6h blocks)
+    decay_min_blocks: int = 4              # D: demotion looks at >= 1 full day (4 x 6h blocks) so the whole dialling-hour mix is covered
     decay_p: float = 0.20                  # D: roll back when P(winner still clears the practical-lift bar vs its holdout) <= 20%
     retire_minutes: int = 3 * 1440         # D: a rolled-back option is not re-promoted for 3 days
     # --- caller id
@@ -44,6 +49,7 @@ class Policy:
     routine_max_per_day: int = 2           # B: Kestrel memo
     incident_slots: int = 1                # B: one of max_requests_per_24h is kept for incidents
     supervisor_hold_minutes: int = 48 * 60 # B
+    outage_retries: int = 12               # D: consecutive failed iterations (30 s apart at most) before exiting with code 2
     eval_interval_minutes: int = 120       # D: routine planning per workflow every 2 simulated hours
     # --- loop work budgets
     max_chunks_per_tick: int = 4           # D: at most ~1M events of ingest between governance/incident passes

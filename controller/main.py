@@ -20,6 +20,12 @@ from .store import Store
 log = logging.getLogger("controller")
 
 
+def pick_due(last_eval: dict, workflows, now: int, interval: int, budget: int) -> list[str]:
+    """Round-robin by staleness: the workflows evaluated longest ago go first, so a busy workflow cannot starve the rest."""
+    due = [wf for wf in workflows if now - last_eval.get(wf, -10**9) >= interval]
+    return sorted(due, key=lambda w: (last_eval.get(w, -10**9), w))[:budget]
+
+
 class Controller:
     def __init__(self, url: str, db_path: str, pol: Policy | None = None):
         self.pol = pol or Policy()
@@ -34,6 +40,9 @@ class Controller:
         self.end_minute = 0
         self.last_eval: dict[str, int] = {}
         self.step_wall = 0.0
+        self.finished = False
+        self.backlog = 0
+        self.sleep = time.sleep
 
     # ------------------------------------------------------------------ hooks
     def _applied(self, prop: dict, version: int):
@@ -83,6 +92,7 @@ class Controller:
                              "(crash between charge and commit; the API has no way to fetch a past validation/LLM result)",
                              detail={"ledger_balance": seen, "simulator_balance": st["credits_remaining"]})
         self.store.put("credits_seen", st["credits_remaining"])
+        self.store.run("DELETE FROM metrics WHERE minute < ?", (st["sim_minute"] - 14 * 1440,))  # audit/proposals are kept forever; only debug metrics expire
         for wf in self.specs:
             self.refresh_config(wf)
         self.reconcile()
@@ -91,6 +101,7 @@ class Controller:
         """Ingest up to `max_chunks_per_tick` chunks; returns how many are still waiting (the backlog)."""
         pend = self.ing.pending()
         before = dict(self.ing.stage)
+        bad0 = self.ing.totals["malformed"]
         t0 = time.perf_counter()
         n = 0
         for m in pend[: self.pol.max_chunks_per_tick]:
@@ -102,6 +113,9 @@ class Controller:
             self.store.metric("ingest_events_per_sec", n / max(dt, 1e-9))
             for k, v in self.ing.stage.items():
                 self.store.metric(f"stage_{k}_seconds", v - before[k])
+        if self.ing.totals["malformed"] > bad0:
+            self.store.metric("ingest_malformed", self.ing.totals["malformed"] - bad0)
+            self.store.audit("ingest_malformed", f"{self.ing.totals['malformed'] - bad0} malformed event line(s) skipped and counted")
         self.handle_control_events()
         cur_day = self.store.now_minute // 1440
         horizon = max((len(s["cadence"]) for s in self.specs.values()), default=3) + 1
@@ -226,52 +240,69 @@ class Controller:
 
     def run(self) -> int:
         self.startup()
-        finished = self.client.state()["finished"]
-        backlog = len(self.ing.pending())
+        self.finished = self.client.state()["finished"]
+        self.backlog = len(self.ing.pending())
+        fails = 0
         while True:
-            if not finished and backlog == 0:  # never ask for more data while there is unread data
-                r = self.advance(self.step_minutes())
-                finished = r["finished"]
-                st = self.client.state()
-                self.store.set_clock(st["sim_minute"], st["ts"])
-                self.inc.credits = st["credits_remaining"]
-                self.store.put("credits_seen", st["credits_remaining"])
-            t0 = time.perf_counter()
-            backlog = self.ingest_pending()                       # P1: ingestion, bounded per tick
-            t1 = time.perf_counter()
-            self.reconcile()                                      # P0: approved changes, stale/abandoned proposals
-            t2 = time.perf_counter()
-            for wf in self.specs:
-                self.safety(wf)                                   # P0: incidents
-            t3 = time.perf_counter()
-            due = sorted((wf for wf in self.specs if self.store.now_minute - self.last_eval.get(wf, -10**9) >= self.pol.eval_interval_minutes),
-                         key=lambda w: self.last_eval.get(w, -10**9))
-            if backlog == 0:                                      # P2/P3 are deferred while evidence is incomplete
-                for wf in due[: self.pol.max_routine_evals_per_tick]:
-                    self.last_eval[wf] = self.store.now_minute
-                    self.plan_routine(wf)
-            self.followups()
-            t4 = time.perf_counter()
-            m = self.store.metric
-            m("ingest_backlog_chunks", backlog)
-            m("t_ingest_seconds", t1 - t0)
-            m("t_governance_seconds", t2 - t1)
-            m("t_incident_seconds", t3 - t2)
-            m("t_planning_seconds", t4 - t3)
-            m("decision_lag_seconds", t4 - t1)                    # everything except ingestion
-            m("step_seconds", t4 - t0)
-            m("routine_due", len(due))
-            m("rss_mb", rss_mb())
-            m("db_mb", sum(os.path.getsize(f) for f in (self.store.path, self.store.path + "-wal") if os.path.exists(f)) / 1e6)
-            m("open_proposals", self.store.one("SELECT COUNT(*) n FROM proposals WHERE state IN ('PENDING','APPROVED','PLANNED')")["n"])
-            m("open_incidents", self.store.one("SELECT COUNT(*) n FROM incidents WHERE state NOT IN ('RESOLVED','ESCALATED')")["n"])
-            m("credits_remaining", self.inc.credits or 0)
-            m("sim_http_errors", self.client.stats["errors"])
-            m("sim_http_retries", self.client.stats["retries"])
-            if finished and backlog == 0:
+            try:
+                done = self._iteration()
+                fails = 0
+            except SimUnavailable as e:
+                # Bounded retries inside the client already failed. Everything durable is intact (nothing commits half-way),
+                # so wait and try the same iteration again; give up with a non-zero exit only after a long outage.
+                fails += 1
+                if fails == 1:
+                    self.store.audit("sim_outage", f"simulator unreachable: {e}; backing off")
+                if fails > self.pol.outage_retries:
+                    self.store.audit("controller_giving_up", f"simulator unreachable for {fails} consecutive iterations; exiting with code 2")
+                    return 2
+                self.sleep(min(2 ** fails, 30))
+                continue
+            if done:
                 break
         self.store.audit("controller_done", f"scenario finished at {self.store.now_ts}; controller exiting cleanly")
         return 0
+
+    def _iteration(self) -> bool:
+        if not self.finished and self.backlog == 0:  # never ask for more data while there is unread data
+            r = self.advance(self.step_minutes())
+            self.finished = r["finished"]
+            st = self.client.state()
+            self.store.set_clock(st["sim_minute"], st["ts"])
+            self.inc.credits = st["credits_remaining"]
+            self.store.put("credits_seen", st["credits_remaining"])
+        t0 = time.perf_counter()
+        self.backlog = backlog = self.ingest_pending()            # P1: ingestion, bounded per tick
+        t1 = time.perf_counter()
+        self.reconcile()                                          # P0: approved changes, stale/abandoned proposals
+        t2 = time.perf_counter()
+        for wf in self.specs:
+            self.safety(wf)                                       # P0: incidents
+        t3 = time.perf_counter()
+        due = pick_due(self.last_eval, self.specs, self.store.now_minute, self.pol.eval_interval_minutes, 10**9)
+        if backlog == 0:                                          # P2/P3 are deferred while evidence is incomplete
+            for wf in due[: self.pol.max_routine_evals_per_tick]:
+                self.last_eval[wf] = self.store.now_minute
+                self.plan_routine(wf)
+        self.followups()
+        t4 = time.perf_counter()
+        m = self.store.metric
+        m("ingest_backlog_chunks", backlog)
+        m("t_ingest_seconds", t1 - t0)
+        m("t_governance_seconds", t2 - t1)
+        m("t_incident_seconds", t3 - t2)
+        m("t_planning_seconds", t4 - t3)
+        m("decision_lag_seconds", t4 - t1)                        # everything except ingestion
+        m("step_seconds", t4 - t0)
+        m("routine_due", len(due))
+        m("rss_mb", rss_mb())
+        m("db_mb", sum(os.path.getsize(f) for f in (self.store.path, self.store.path + "-wal") if os.path.exists(f)) / 1e6)
+        m("open_proposals", self.store.one("SELECT COUNT(*) n FROM proposals WHERE state IN ('PENDING','APPROVED','PLANNED')")["n"])
+        m("open_incidents", self.store.one("SELECT COUNT(*) n FROM incidents WHERE state NOT IN ('RESOLVED','ESCALATED')")["n"])
+        m("credits_remaining", self.inc.credits or 0)
+        m("sim_http_errors", self.client.stats["errors"])
+        m("sim_http_retries", self.client.stats["retries"])
+        return self.finished and backlog == 0
 
 
 def rss_mb() -> float:
