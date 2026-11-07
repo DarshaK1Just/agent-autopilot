@@ -252,7 +252,7 @@ def _decide(ctx: WfCtx, counts: dict, opts: list[str], ctl: str, retired: dict):
             row["guardrail"] = g
             row["status"] = "winner" if ok else "guardrail_blocked"
             if ok:
-                win.append((c.diff, o))
+                win.append((c.lower(1 - pol.alpha), o))  # rank by lower credible bound: damps winner's curse
         else:
             row["status"] = "undecided"
         rows[o] = row
@@ -404,10 +404,11 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         cr, cw = ev.stratified(recent, w, ctl, ctx.primary, ctx.prior), ev.stratified(whole, w, ctl, ctx.primary, ctx.prior)
         if cr is None or min(cr.n_arm, cr.n_ctl) < pol.decay_min_trials:
             continue
-        half = 0.5 * max(s.get("promo_lift", 0.0), pol.rel_min_lift * cr.rate_ctl)
-        p_still = cr.p_greater(half)
+        # A promoted arm must keep clearing the bar it was promoted on (practical lift over its own holdout). The lift
+        # measured at promotion is not used: it is a maximum over noisy arms and biased upward.
+        p_still = cr.p_greater(pol.rel_min_lift * cr.rate_ctl)
         p_harm = 1.0 - (cw.p_greater(-pol.rel_harm * cw.rate_ctl) if cw else 1.0)
-        evd[scope] = {"recent": _contrast_row(cr), "p_still_winning": round(p_still, 3), "promo_lift": s.get("promo_lift"),
+        evd[scope] = {"recent": _contrast_row(cr), "p_still_clears_practical_lift": round(p_still, 3),
                       "whole": _contrast_row(cw) if cw else None, "window_blocks": pol.decay_window_blocks}
         if p_still <= pol.decay_p or p_harm >= pol.harm_confidence:
             others = [o for o in opts if o not in (w, ctl) and o not in st['dropped']]
@@ -418,7 +419,7 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
             else:
                 out_patch["allocations"][scope] = {dim: None}
                 upd[scope] = None
-            reasons.append(f"{dim}={w} in {scope}: recent lift {cr.diff:+.3f} (P still ≥ half of {s.get('promo_lift', 0):+.3f}: {p_still:.2f})")
+            reasons.append(f"{dim}={w} in {scope}: recent lift {cr.diff:+.3f} (P still clears the {pol.rel_min_lift:.0%} practical bar: {p_still:.2f})")
     if not reasons:
         return []
     return [Intent(ctx.okey("rollback", dim, sorted(upd)), "rollback", ctx.wf, (dim,), out_patch,

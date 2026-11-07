@@ -4,14 +4,14 @@
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.348 | +4.6% | 0.243 | +2.1% | 0.499 | +1.6% | 8% | 66 (47) |
-| nw_kyc | 0.441 | +21.4% | 0.293 | +21.0% | 0.583 | -1.2% | 0% | 27 (21) |
-| nw_renewal | 0.464 | +10.6% | 0.277 | +5.2% | 0.572 | +4.9% | 30% | 59 (42) |
-| ALL | 0.407 | +10.4% | 0.265 | +6.8% | 0.543 | +2.6% | 14% | 152 (110) |
+| ks_cancel | 0.342 | +2.8% | 0.241 | +1.3% | 0.495 | +0.8% | 8% | 61 (47) |
+| nw_kyc | 0.430 | +18.3% | 0.288 | +18.9% | 0.580 | -1.8% | 0% | 26 (21) |
+| nw_renewal | 0.453 | +8.0% | 0.279 | +5.7% | 0.557 | +2.2% | 15% | 50 (42) |
+| ALL | 0.398 | +8.0% | 0.263 | +6.2% | 0.536 | +1.1% | 9% | 137 (110) |
 
 ## Changes applied by the controller
 
-9 applied — neutral: 1, beneficial: 8
+8 applied — neutral: 1, beneficial: 7
 
 - ks_cancel v2 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=-0.004 didΔ=+0.000 → **neutral**
 - nw_renewal v2 (controller_approved) dims=['welcome_message', 'voice', 'caller_id'] engageΔ=+0.060 didΔ=-0.017 → **beneficial**
@@ -21,22 +21,21 @@
 - nw_kyc v3 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.151 → **beneficial**
 - ks_cancel v3 (controller_approved) dims=['welcome_message'] engageΔ=+0.035 didΔ=+0.000 → **beneficial**
 - nw_kyc v4 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.066 → **beneficial**
-- nw_renewal v5 (controller_approved) dims=['welcome_message'] engageΔ=+0.079 didΔ=+0.000 → **beneficial**
 
 ## Governance
 
 ```
 {
-  "approval_requests": 9,
+  "approval_requests": 8,
   "decisions": {
-    "approved": 8,
+    "approved": 7,
     "rejected": 1,
     "expired": 0
   },
   "rejection_reasons": {
     "approver declined (judgement call)": 1
   },
-  "applied_via_approval": 8,
+  "applied_via_approval": 7,
   "auto_applied": 1,
   "auto_apply_rejected": 0,
   "apply_conflicts": 0,
@@ -62,9 +61,9 @@
   "nw_renewal:welcome_message=W3": {
     "3": 0.847,
     "4": 0.842,
-    "5": 0.416,
-    "6": 0.0,
-    "7": 0.0
+    "5": 0.844,
+    "6": 0.844,
+    "7": 0.846
   }
 }
 ```

@@ -19,7 +19,7 @@ class Policy:
     min_cohort_gain: float = 0.004         # D: ... and add >= 0.4pt absolute KPI
     max_cohorts: int = 6                   # D
     decay_window_blocks: int = 6           # D: 36h window (6h blocks)
-    decay_p: float = 0.20                  # D: roll back when P(winner still holds half its lift) <= 20%
+    decay_p: float = 0.20                  # D: roll back when P(winner still clears the practical-lift bar vs its holdout) <= 20%
     decay_min_trials: int = 100            # D
     retire_minutes: int = 3 * 1440         # D: a rolled-back option is not re-promoted for 3 days
     # --- caller id

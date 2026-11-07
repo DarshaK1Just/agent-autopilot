@@ -591,3 +591,32 @@ def test_cohort_needs_bonferroni_bar_and_never_uses_a_harmful_option(store):
         store.run("INSERT INTO agg VALUES('w1',1,1,'default','welcome_message',?,'all','',?,?,?)", (opt, conn * 3, conn, eng))
     ctx = WfCtx(store, SPEC, cfg, 1, 100, 10000, POL)
     assert _cohort_candidates(ctx, "welcome_message", {}, ds, "W1", {"W3"}) == {}
+
+
+# ----------------------------------------------------------------------------- decay watch
+def _promoted(store, winner_rates, ctl_rates):
+    """A promoted W3 (85%) with a W1 holdout (15%), counts spread over the last four 6h blocks."""
+    from controller.planner import save_exp
+    cfg = copy.deepcopy(CFG)
+    cfg["allocations"]["default"]["welcome_message"] = {"W3": 0.85, "W1": 0.15}
+    save_exp(store, "w1", "welcome_message", {"scopes": {"default": {"phase": "PROMOTED", "winner": "W3", "control": "W1",
+                                                                    "start_ver": 2, "promo_lift": 0.09}}, "retired": {}, "dropped": {}})
+    for blk in range(5, 9):
+        for opt, (conn, eng) in (("W3", winner_rates), ("W1", ctl_rates)):
+            store.run("INSERT INTO agg VALUES('w1',?,2,'default','welcome_message',?,'all','',?,?,?)", (blk, opt, conn * 3, conn, eng))
+    store.run("INSERT INTO agg VALUES('w1',-5,1,'default','voice','V1','all','',6000,2000,1100)")
+    return WfCtx(store, SPEC, cfg, 2, 2 * 1440, 10 * 1440, POL)
+
+
+def test_winner_that_stopped_winning_is_rolled_back(store):
+    from controller.planner import plan_lever
+    ctx = _promoted(store, (1000, 540), (200, 108))  # both arms at 54%: the lift is gone
+    intents = plan_lever(ctx, "welcome_message", held=False)
+    assert [i.kind for i in intents] == ["rollback"] and intents[0].urgent
+    assert cfgutil.eff(cfgutil.apply_patch(ctx.cfg, intents[0].patch), "default", "welcome_message")["W1"] >= 0.5
+
+
+def test_winner_that_still_wins_is_kept_even_if_below_its_promotion_lift(store):
+    from controller.planner import plan_lever
+    ctx = _promoted(store, (1000, 590), (200, 108))  # +5pts now, promoted at +9pts: smaller, but still a clear win
+    assert plan_lever(ctx, "welcome_message", held=False) == []

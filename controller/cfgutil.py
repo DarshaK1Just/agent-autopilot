@@ -106,6 +106,8 @@ def diff(old: dict, new: dict) -> dict:
                           "removed": [k for k in oc if k not in nc]}
     for k in sorted(set(old["allocations"]) | set(new["allocations"])):
         for dim in AGENT_DIMS:
+            if k != "default" and dim not in (old["allocations"].get(k) or {}) and dim not in (new["allocations"].get(k) or {}):
+                continue  # inherited from default; the default entry already shows the change
             a, b = eff(old, k, dim), eff(new, k, dim)
             if tv(a, b) > 1e-9:
                 out[f"allocations.{k}.{dim}"] = {"from": a, "to": b}

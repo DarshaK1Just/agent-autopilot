@@ -54,6 +54,7 @@ def explain(db, wf: str, at: int):
     print(f"[{wf}] config v{p['applied_version']} went live at {fmt(db, chosen['minute'])} (route: {p['route']}; dims: {', '.join(j(p['dims']))})")
     print(f"  WHY    : {body['change_summary']}")
     print(f"           {body['rationale']}")
+    print(f"  CHANGE : {json.dumps(body['diff'], default=str)[:700]}")
     print(f"  SCOPE  : affected_leads={body['affected_leads']}  impact_score={body['impact_score']}  base_version={p['base_version']}")
     print(f"  DRY RUN: {json.dumps(body['dry_run'], default=str)[:600]}")
     print("  TIMELINE (from controller audit):")
