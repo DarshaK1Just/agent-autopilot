@@ -9,8 +9,8 @@
 
 ## 0. TL;DR
 A single-process controller. It keeps per-arm counters from the event stream in SQLite (one transaction per chunk, memory bounded by a batch), runs randomised welcome/voice tests with one deterministic Bayesian rule plus a confirmation step on fresh data, reroutes degraded caller IDs, answers hallucination incidents (previous prompt first, LLM only if needed), and sends every change through an explicit proposal state machine with deterministic ids.
-public_01 +8.0% conclusion rate vs baseline (12 changes, 0 harmful); public_02 +22.1% (16 changes, 0 harmful, hallucinated calls 416→184, 5 credits, incident MTTR 240 min); public_03 +16.2% in 3 min 32 s, 345 MB peak (40 changes, 0 harmful).
-Four SIGKILLs mid-run: no duplicate, no lost proposal, one continuous audit trail. Decision path p99 0.17 s; ingest 72k events/s.
+public_01 +8.0% conclusion rate vs baseline (12 changes, 0 harmful); public_02 +22.1% (16 changes, 0 harmful, hallucinated calls 416→184, 5 credits, incident MTTR 240 min); public_03 +16.2% in 3 min 24 s, 346 MB peak (40 changes, 0 harmful).
+Four SIGKILLs mid-run: no duplicate, no lost proposal, one continuous audit trail. Decision path p99 0.13 s; ingest 73k events/s.
 Not built: call-time optimisation, cross-axis cohorts, UI, cross-tenant credit arbitration.
 Weakest points: little statistical power at dev scale (9–33% of the engagement headroom) and slow decay detection on small workflows.
 
@@ -235,7 +235,7 @@ The table is `TRANSITIONS` in `governance.py`; every state change goes through o
 * **Where the 240 minutes go** (`reports/performance.md` §9): 195 min detection (statistical sample + the 45-minute second look), <1 min validation, ~40 min approver, ≤15 min apply polling. The first and last are controller-controlled; the approver wait is policy, and no public policy lets a prompt be auto-applied.
 
 ## 8. Scale
-Measured on public_03_load (`reports/load_test.md`, `reports/performance.md`): the whole run — 7 history days + 5 live days, 12 workflows, 9.74 M events, simulator on the same box — took **3 min 32 s** (≈ 43 s per live simulated day against the 10-minute budget). Ingest 72k events/s (mean over ingest time, max 139k). Decision path per step: mean 0.06 s, p95 0.12 s, p99 0.17 s, max 0.18 s; ingestion is bursty (max 17.5 s for a step that reads four chunks). Peak RSS **345 MB**, DB 99.5 MB, 0 HTTP errors, backlog high-water 19 chunks (history bootstrap), drained in 5 iterations.
+Measured on public_03_load (`reports/load_test.md`, `reports/performance.md`): the whole run — 7 history days + 5 live days, 12 workflows, 9.74 M events, simulator on the same box — took **3 min 24 s** (≈ 41 s per live simulated day against the 10-minute budget). Ingest 73k events/s (mean over ingest time, max 141k). Decision path per step: mean 0.05 s, p95 0.10 s, p99 0.13 s, max 0.15 s; ingestion is bursty (max 15.9 s for a step that reads four chunks). Peak RSS **346 MB**, DB 99.5 MB, 0 HTTP errors, backlog high-water 19 chunks (history bootstrap), drained in 5 iterations.
 **Memory** no longer grows with leads or events: leads live in SQLite (the old resident map cost 128 bytes per lead), so RSS is flat at one batch plus the interpreter (synthetic: 138 MB after day 1 and day 2). Synthetic 10× shape (120 workflows, 7.7 M events/day, labelled synthetic): 87k events/s, 287 MB (previously 67k events/s, 1125 MB).
 **At 10×** the first limit is a single SQLite writer and one decode core (≈97 s of ingest per simulated day, still far below real time: production is ~100 events/s), then DB size (leads ≈ 1 GB / 12 days, pruned past the cadence window), then planner time (linear in workflows, capped at 8 evaluations per step). Path beyond that: `workflow_id → shard`, one worker and DB per shard; nothing is stored that crosses workflows except the credit balance and the event cursor. Not built: Kafka or distributed workers.
 
@@ -347,7 +347,7 @@ Reading the numbers: most of the gain is pickup (spreading volume across caller 
 | Resident lead map | Fast lookups | 128 B/lead, rebuilt on restart, O(N) scans; SQLite batched lookups cost ~5% of ingest. |
 | `ANALYZE` for query plans | Let SQLite choose | Not run automatically; the hot query pins its index (`INDEXED BY`) instead. |
 | async HTTP client / threads | "Low latency" | The loop spends ≤0.2 s per step outside ingestion and the simulator waits for it; no measured blocking. |
-| Faster JSON library | Decode is 43% of ingest | 72k events/s against a need of ~20/s; a dependency for a non-bottleneck. |
+| Faster JSON library | Decode is 43% of ingest | 73k events/s against a need of ~20/s; a dependency for a non-bottleneck. |
 | Empirical-Bayes / heterogeneity tests | Many slices | Too many techniques for the data available; Bonferroni over what was examined is simpler. |
 | Postgres/Redis, Kafka | Already operated / "scale" | SQLite WAL fits the box and gives an atomic cursor + counters with nothing to operate; sharding by workflow is the path. |
 | LLM-first incident fix | Matches the brief | The previous prompt is free, has production history and needs one validation. |

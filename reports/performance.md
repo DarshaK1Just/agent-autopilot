@@ -7,28 +7,28 @@ One loop iteration = one simulated step (15 or 60 simulated minutes). 354 steps,
 
 | stage | mean | p50 | p95 | p99 | max |
 |---|---:|---:|---:|---:|---:|
-| `T_fetch` (HTTP stream of a chunk, per ingesting step) | 0.08 s | 0.03 | 0.14 | 1.26 | 1.37 |
-| `T_decode` (JSON) | 0.31 s | 0.06 | 0.67 | 6.20 | 6.57 |
-| `T_transform` (field extraction, interning) | 0.13 s | 0.04 | 0.44 | 2.33 | 2.53 |
-| `T_aggregate` (numpy group-by) | 0.04 s | 0.01 | 0.05 | 0.80 | 0.86 |
-| `T_db` (lead insert/lookup, counter upsert, commit) | 0.16 s | 0.05 | 0.29 | 2.76 | 3.62 |
-| **ingestion, whole step** | 0.40 s | 0.01 | 0.88 | 12.2 | 17.5 |
-| `T_governance` (reconcile: poll approvals, apply) | 0.05 s | 0.04 | 0.10 | 0.14 | 0.17 |
-| `T_incident` (all workflows, every step) | 0.002 s | 0.001 | 0.005 | 0.006 | 0.007 |
-| `T_planning` (routine planners, ≤8 workflows) | 0.008 s | 0.000 | 0.03 | 0.07 | 0.10 |
-| **decision path (governance + incident + planning)** | **0.06 s** | **0.05** | **0.12** | **0.17** | **0.18** |
+| `T_fetch` (HTTP stream of a chunk, per ingesting step) | 0.07 s | 0.03 | 0.14 | 1.12 | 1.17 |
+| `T_decode` (JSON) | 0.29 s | 0.06 | 0.61 | 5.37 | 5.70 |
+| `T_transform` (field extraction, interning) | 0.13 s | 0.03 | 0.46 | 2.24 | 2.34 |
+| `T_aggregate` (numpy group-by) | 0.04 s | 0.01 | 0.07 | 0.65 | 0.76 |
+| `T_db` (lead insert/lookup, counter upsert, commit) | 0.15 s | 0.05 | 0.27 | 2.45 | 2.73 |
+| **ingestion, whole step** | 0.40 s | 0.01 | 0.85 | 14.7 | 15.9 |
+| `T_governance` (reconcile: poll approvals, apply) | 0.04 s | 0.04 | 0.08 | 0.10 | 0.15 |
+| `T_incident` (all workflows, every step) | 0.002 s | 0.001 | 0.004 | 0.006 | 0.007 |
+| `T_planning` (routine planners, ≤8 workflows) | 0.006 s | 0.000 | 0.02 | 0.06 | 0.08 |
+| **decision path (governance + incident + planning)** | **0.05 s** | **0.05** | **0.10** | **0.13** | **0.15** |
 
 Reading it: ingestion is bursty (a step that finds a day's worth of chunks costs seconds; most steps cost milliseconds). The decision path never exceeds 0.2 s and does not grow with ingest volume, because it reads counters, not events. `T_external` (the HTTP round trips for polling approvals, proposals and applies) is inside `T_governance` and is loopback-fast here; on a real network it would be the dominant term, bounded by the client's timeouts (connect 5 s, read 120 s) and at most 5 retries for reads only.
-Where the time goes inside ingestion (summed over the run, 121.5 s of the 133.6 s spent ingesting; the rest is chunk listing and bookkeeping): JSON decode 43%, SQLite 22%, transform 18%, fetch 11%, numpy aggregation 6%.
+Where the time goes inside ingestion (summed over the run, 114.1 s of the 133.8 s spent ingesting; the rest is chunk listing and bookkeeping): JSON decode 43%, SQLite 22%, transform 19%, fetch 11%, numpy aggregation 6%.
 
 ## 2. Throughput and memory, public_03
 | metric | value |
 |---|---|
 | events ingested | 9.74 M (5.54 M history bootstrap + 4.20 M live) |
-| wall clock, whole run | 3 min 32 s |
-| ingest rate (events per second of ingest time) | mean 71.7k, p50 70.9k, max 139k |
-| peak RSS | 345 MB (previous design: 483 MB) |
-| RSS at steady state | 288–312 MB, flat across the run |
+| wall clock, whole run | 3 min 24 s |
+| ingest rate (events per second of ingest time) | mean 73.4k, p50 72.5k, max 141k |
+| peak RSS | 346 MB (previous design: 483 MB) |
+| RSS at steady state | 290–318 MB, flat across the run |
 | SQLite size | 99.5 MB after 12 simulated days × 12 workflows |
 | HTTP errors / retries | 0 / 0 |
 | backlog high-water | 19 chunks (the history bootstrap), drained 4 chunks per tick |
@@ -78,20 +78,20 @@ If events arrive faster than they are processed, the backlog is the number of un
 |---|---|---|---|
 | events/day | 0.84 M | 8.4 M | 84 M |
 | real-time ingest need | ~10 events/s average | ~100 | ~1,000 |
-| ingest cost per simulated day (measured/derived) | 12 s | 97 s (synthetic 88 s) | ~16 min, one core |
+| ingest cost per simulated day (measured/derived) | 11 s | 97 s (synthetic 88 s) | ~16 min, one core |
 | heap | ~300 MB | ~300 MB (batch-bound) | ~300 MB per worker |
 | SQLite | 100 MB / 12 days | ~1 GB / 12 days (leads dominate; pruned after the cadence window) | per shard |
-| decision path | 0.06 s / step | ~0.6 s / step (linear in workflows; routine planning is capped at 8 workflows per step) | per shard |
+| decision path | 0.05 s / step | ~0.5 s / step (linear in workflows; routine planning is capped at 8 workflows per step) | per shard |
 | what limits it | nothing | single-writer SQLite and one core for decode | needs sharding |
 Migration path: `workflow_id → shard`. Everything stored is keyed by workflow, so a worker owning a set of workflows needs only its own SQLite file, its own cursor over the event stream filtered to its workflows, and read access to the shared items below. Global state is explicit and small: the simulator's `/sim/state` credit balance (spent only inside `incidents.py`), the world key, the event cursor (would become one cursor per shard) and the approver request counts (derived per workflow from `proposals`). Not built: Kafka, a work queue or distributed workers. At the assignment's scale they add failure modes without removing a bottleneck.
 
 ## 8. Performance budgets (derived from the required scale)
 | budget | target | measured |
 |---|---|---|
-| sustained ingest | ≥ 5,000 events/s (≥ 250× the peak real-time need of ~20 events/s) | 72k/s |
-| decision path per step, p99 | < 1 s (decisions are acted on at 15-minute granularity) | 0.17 s |
-| one tick's ingest, max | < 30 s (bounded by `max_chunks_per_tick`) | 17.5 s |
-| RSS | < 1 GB on the 8 GB evaluator box | 345 MB peak |
+| sustained ingest | ≥ 5,000 events/s (≥ 250× the peak real-time need of ~20 events/s) | 73k/s |
+| decision path per step, p99 | < 1 s (decisions are acted on at 15-minute granularity) | 0.13 s |
+| one tick's ingest, max | < 30 s (bounded by `max_chunks_per_tick`) | 15.9 s |
+| RSS | < 1 GB on the 8 GB evaluator box | 346 MB peak |
 | DB growth | < 15 MB per simulated day at 12 workflows | ~8 MB/day |
 | backlog recovery | ≥ 1 M events per iteration | 1 M |
 

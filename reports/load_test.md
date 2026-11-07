@@ -7,12 +7,12 @@ Method: `scripts/run_scenario.sh 03_load 8703` — simulator and controller on o
 | metric | value |
 |---|---|
 | scenario | 12 workflows, 7 history days + 5 live days, ~840k events/day live |
-| wall clock, whole run (simulator generating events concurrently) | **3 min 32 s** (≈ 43 s per live simulated day; budget was 10 min) |
+| wall clock, whole run (simulator generating events concurrently) | **3 min 24 s** (≈ 41 s per live simulated day; budget was 10 min) |
 | events ingested | 9.74 M (5.54 M history bootstrap + 4.20 M live) |
-| ingest rate | mean 71.7k events/s of ingest time (p50 70.9k, max 139k) |
-| decision path per step (governance + incident + planning) | mean 0.06 s, p95 0.12 s, p99 0.17 s, max 0.18 s |
-| ingestion per step | mean 0.40 s, p95 0.88 s, p99 12.2 s, max 17.5 s (steps that read four chunks) |
-| peak resident memory (controller) | **345 MB** (previous design: 483 MB) |
+| ingest rate | mean 73.4k events/s of ingest time (p50 72.5k, max 141k) |
+| decision path per step (governance + incident + planning) | mean 0.05 s, p95 0.10 s, p99 0.13 s, max 0.15 s |
+| ingestion per step | mean 0.40 s, p95 0.85 s, p99 14.7 s, max 15.9 s (steps that read four chunks) |
+| peak resident memory (controller) | **346 MB** (previous design: 483 MB) |
 | SQLite size | 99.5 MB after 12 simulated days |
 | HTTP errors / retries | 0 / 0 |
 | backlog high-water | 19 chunks (history bootstrap), drained in 5 iterations |
