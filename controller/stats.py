@@ -129,3 +129,48 @@ def two_prop_z(k1: int, n1: int, k0: int, n0: int) -> float:
     p = (k1 + k0) / (n1 + n0)
     se = math.sqrt(max(p * (1 - p) * (1 / n1 + 1 / n0), 1e-12))
     return (k1 / n1 - k0 / n0) / se
+
+
+def chi2_sf(x: float, df: int) -> float:
+    """P(Chi2_df >= x) via the regularised upper incomplete gamma function."""
+    if x <= 0 or df <= 0:
+        return 1.0
+    a, x = df / 2.0, x / 2.0
+    if x < a + 1:
+        term = total = 1.0 / a
+        n = a
+        for _ in range(500):
+            n += 1
+            term *= x / n
+            total += term
+            if abs(term) < abs(total) * 1e-12:
+                break
+        return max(0.0, 1.0 - total * math.exp(-x + a * math.log(x) - math.lgamma(a)))
+    tiny = 1e-300
+    b = x + 1 - a
+    c = 1 / tiny
+    d = 1 / b
+    h = d
+    for i in range(1, 500):
+        an = -i * (i - a)
+        b += 2
+        d = an * d + b
+        d = tiny if abs(d) < tiny else d
+        c = b + an / c
+        c = tiny if abs(c) < tiny else c
+        d = 1 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1) < 1e-12:
+            break
+    return min(1.0, math.exp(-x + a * math.log(x) - math.lgamma(a)) * h)
+
+
+def heterogeneity_p(ests: list[tuple[float, float]]) -> float:
+    """Cochran's Q test that per-slice effects are all equal (df = k-1)."""
+    if len(ests) < 2:
+        return 1.0
+    w = [1.0 / max(sd * sd, 1e-12) for _, sd in ests]
+    mu = sum(wi * d for wi, (d, _) in zip(w, ests)) / sum(w)
+    q = sum(wi * (d - mu) ** 2 for wi, (d, _) in zip(w, ests))
+    return chi2_sf(q, len(ests) - 1)
