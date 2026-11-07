@@ -41,7 +41,7 @@ def run(lift: float, challengers: int, trials: int = 600, looks: int = 8, seed: 
 
 if __name__ == "__main__":
     print("# Decision-rule operating characteristics\n")
-    print(f"alpha={Policy().alpha} (Bonferroni over challengers), rel_min_lift={Policy().rel_min_lift}, min_trials_arm={Policy().min_trials_arm}; "
+    print(f"alpha={Policy().tail_prob} (Bonferroni over challengers), min_relative_lift={Policy().min_relative_lift}, min_trials_arm={Policy().min_trials_arm}; "
           "8 looks x 150 connected calls per arm, 600 simulated experiments per row.\n")
     print("| scenario | P(promote some arm) | mean connected calls per arm at promotion |\n|---|---|---|")
     for name, lift, k in [("all arms identical, 1 challenger", 0.0, 1), ("all arms identical, 3 challengers", 0.0, 3),

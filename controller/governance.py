@@ -23,9 +23,9 @@ from .store import Store
 OPEN_STATES = ("PLANNED", "PENDING", "APPROVED")
 # The whole state machine. Anything not listed is terminal. Every change of `proposals.state` goes through Governor._move.
 TRANSITIONS = {
-    "PLANNED": {"PENDING", "APPLIED", "STALE", "REFUSED", "FAILED"},
+    "PLANNED": {"PENDING", "APPLIED", "STALE", "REFUSED", "FAILED", "ABANDONED"},
     "PENDING": {"APPROVED", "REJECTED", "EXPIRED", "LAPSED", "APPLIED", "ABANDONED", "FAILED"},
-    "APPROVED": {"APPLIED", "LAPSED", "STALE", "FAILED"},
+    "APPROVED": {"APPLIED", "LAPSED", "STALE", "FAILED", "ABANDONED"},
 }
 
 
@@ -107,17 +107,24 @@ class Governor:
         return True, ""
 
     # ------------------------------------------------------------------ submission
-    def propose(self, ctx: WfCtx, intents: list[Intent], eligible_fn=None) -> dict | None:
+    def propose(self, ctx: WfCtx, intents: list[Intent]) -> dict | None:
         if not intents:
             return None
-        urgent = any(i.urgent for i in intents)
-        # Urgent work (incident fixes, rollbacks) is not blocked by routine proposals already waiting; if the routine one
-        # is applied first, the urgent one goes STALE and is re-planned from the new base.
-        if any(not (urgent and not p["urgent"]) for p in self.in_flight(ctx.wf)):
-            return None
-        new, dims = self.compose(ctx, intents)
+        new, dims = self.compose(ctx, intents)  # always built from the live config plus the intended diff
         if not dims:
             return None
+        urgent = any(i.urgent for i in intents)
+        flying = self.in_flight(ctx.wf)
+        if flying and not urgent:
+            return None  # one routine proposal at a time, and never alongside anything else
+        superseded = []
+        for p in flying:
+            if p["urgent"]:
+                return None  # one urgent proposal at a time
+            if set(dims) & set(json.loads(p["dims"])):
+                superseded.append(p)  # same dimension: the routine one would race the urgent one, so it yields
+            # Disjoint dimensions may coexist; the base-version check still serialises their applies, so the second one
+            # to land goes STALE and is re-planned from the new base.
         route = self.choose_route(ctx, new, dims, intents)
         fp = cfgutil.fingerprint(new)
         prior = self.s.q("SELECT state, submitted_minute, created_minute FROM proposals WHERE wf=? AND base_version=? AND pid LIKE ?",
@@ -140,6 +147,8 @@ class Governor:
                                  detail={"intents": [i.key for i in intents], "reason": why})
                 return None
             self.s.put(f"deferred:{ctx.wf}", None)
+        for p in superseded:
+            self._terminal(p, "ABANDONED", f"superseded by an urgent change touching {sorted(set(dims) & set(json.loads(p['dims'])))}", {})
         pid = f"{ctx.wf}-v{ctx.version}-{fp}" + (f"-r{n_prev}" if n_prev else "")
         body = self._body(ctx, intents, new, dims, pid)
         with self.s.tx():

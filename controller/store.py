@@ -21,12 +21,8 @@ CREATE TABLE IF NOT EXISTS agg (
   dials INT NOT NULL, conn INT NOT NULL, eng INT NOT NULL,
   PRIMARY KEY (wf, blk, ver, coh, dim, opt, sl, sv)
 ) WITHOUT ROWID;
-
--- Hour-of-day behaviour by slice, bucketed by day.
-CREATE TABLE IF NOT EXISTS hr (
-  wf TEXT, day INT, hour INT, sl TEXT, sv TEXT, dials INT NOT NULL, conn INT NOT NULL, eng INT NOT NULL,
-  PRIMARY KEY (wf, day, hour, sl, sv)
-) WITHOUT ROWID;
+-- Evidence queries always fix (wf, dim, sl, sv) and bound blk: this keeps them proportional to the window, not the history.
+CREATE INDEX IF NOT EXISTS agg_scan ON agg(wf, dim, sl, sv, blk);
 
 -- Automated QA flags on connected calls.
 CREATE TABLE IF NOT EXISTS qa (
@@ -73,6 +69,7 @@ CREATE TABLE IF NOT EXISTS proposals (
   applied_version INT, result TEXT, reasons TEXT, urgent INT DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS prop_wf ON proposals(wf, state);
+CREATE INDEX IF NOT EXISTS prop_state ON proposals(state);
 
 CREATE TABLE IF NOT EXISTS incidents (
   id TEXT PRIMARY KEY, wf TEXT NOT NULL, kind TEXT NOT NULL,

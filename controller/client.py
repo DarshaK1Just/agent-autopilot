@@ -28,7 +28,7 @@ class SimUnavailable(Exception):
 
 class SimClient:
     def __init__(self, base_url: str, timeout: float = 120.0, retries: int = 5, backoff: float = 0.5):
-        self.http = httpx.Client(base_url=base_url, timeout=timeout)
+        self.http = httpx.Client(base_url=base_url, timeout=httpx.Timeout(timeout, connect=5.0, write=30.0, pool=5.0))
         self.retries, self.backoff = retries, backoff
         self.stats = {"requests": 0, "retries": 0, "errors": 0}
 

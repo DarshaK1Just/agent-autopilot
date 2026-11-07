@@ -4,9 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
-from collections import Counter
 
 from . import evidence as ev
 from .client import SimClient, SimError, SimUnavailable
@@ -50,7 +50,8 @@ class Controller:
             return n
         where = {c["id"]: c["where"] for c in info["cohorts"]}
         cnt = 0
-        feats = Counter(f for k, f in self.ing.leads.items() if lo <= k < hi)
+        feats = {r["feat"]: r["n"] for r in self.store.q(
+            "SELECT feat, COUNT(*) n FROM leads WHERE lead_id>=? AND lead_id<? GROUP BY feat", (lo, hi))}
         for fi, c in feats.items():
             ft = dict(zip(("lang", "city_tier", "age_band", "value_band"), self.ing.feat_list[fi]))
             for cid in info["patch_scopes"]:
@@ -75,26 +76,37 @@ class Controller:
                          detail={"cursor_events": self.store.get("cur_events", -1), "cursor_history": self.store.get("cur_history", -1),
                                  "open_proposals": [r["pid"] for r in self.store.q("SELECT pid FROM proposals WHERE state IN ('PLANNED','PENDING','APPROVED')")]})
         self.store.put("started", True)
-        self.ingest_pending()
+        seen = self.store.get("credits_seen")
+        if seen is not None and st["credits_remaining"] < seen - 1e-9:
+            # The simulator charged credits that our ledger never recorded: a crash between the charge and our commit.
+            self.store.audit("credit_spend_unrecorded", f"{seen - st['credits_remaining']:.0f} credits were spent but no result was recorded "
+                             "(crash between charge and commit; the API has no way to fetch a past validation/LLM result)",
+                             detail={"ledger_balance": seen, "simulator_balance": st["credits_remaining"]})
+        self.store.put("credits_seen", st["credits_remaining"])
         for wf in self.specs:
             self.refresh_config(wf)
         self.reconcile()
 
-    def ingest_pending(self):
+    def ingest_pending(self) -> int:
+        """Ingest up to `max_chunks_per_tick` chunks; returns how many are still waiting (the backlog)."""
+        pend = self.ing.pending()
+        before = dict(self.ing.stage)
         t0 = time.perf_counter()
         n = 0
-        for m in self.ing.pending():
-            r = self.ing.ingest_chunk(m)
-            n += r.get("events", 0)
+        for m in pend[: self.pol.max_chunks_per_tick]:
+            n += self.ing.ingest_chunk(m).get("events", 0)
         dt = time.perf_counter() - t0
         if n:
             self.store.metric("ingest_events", n)
             self.store.metric("ingest_seconds", dt)
             self.store.metric("ingest_events_per_sec", n / max(dt, 1e-9))
+            for k, v in self.ing.stage.items():
+                self.store.metric(f"stage_{k}_seconds", v - before[k])
         self.handle_control_events()
         cur_day = self.store.now_minute // 1440
         horizon = max((len(s["cadence"]) for s in self.specs.values()), default=3) + 1
         self.ing.prune_leads(cur_day, horizon)
+        return max(len(pend) - self.pol.max_chunks_per_tick, 0)
 
     # ------------------------------------------------------------------ config tracking / supervisor edits
     def refresh_config(self, wf: str):
@@ -145,16 +157,19 @@ class Controller:
         d = self.cfgs[wf]
         return WfCtx(self.store, self.specs[wf], d["config"], d["version"], self.store.now_minute, self.end_minute, self.pol)
 
-    def evaluate(self, wf: str, routine: bool):
+    def safety(self, wf: str):
+        """P0 work, every tick: incident detection, verification and the fix proposal."""
         ctx = self.ctx(wf)
         self.inc.check(ctx)
         self.inc.verify(ctx)
         urgent = self.inc.respond(ctx)
-        if urgent:
-            if self.gov.propose(ctx, urgent) is None:
-                self.inc.reopen(wf)
-            return
-        if not routine or self.inc.active(wf) or self.gov.in_flight(wf):
+        if urgent and self.gov.propose(ctx, urgent) is None:
+            self.inc.reopen(wf)
+
+    def plan_routine(self, wf: str):
+        """P2/P3 work: welcome/voice tests, decay watch, caller-ID health. One batched proposal per workflow."""
+        ctx = self.ctx(wf)
+        if self.inc.active(wf) or self.gov.in_flight(wf):
             return
         held = self.held(wf)
         intents = []
@@ -212,34 +227,56 @@ class Controller:
     def run(self) -> int:
         self.startup()
         finished = self.client.state()["finished"]
-        n_steps = 0
+        backlog = len(self.ing.pending())
         while True:
-            if not finished:
+            if not finished and backlog == 0:  # never ask for more data while there is unread data
                 r = self.advance(self.step_minutes())
                 finished = r["finished"]
                 st = self.client.state()
                 self.store.set_clock(st["sim_minute"], st["ts"])
                 self.inc.credits = st["credits_remaining"]
+                self.store.put("credits_seen", st["credits_remaining"])
             t0 = time.perf_counter()
-            self.ingest_pending()
-            self.reconcile()
-            n_steps += 1
+            backlog = self.ingest_pending()                       # P1: ingestion, bounded per tick
+            t1 = time.perf_counter()
+            self.reconcile()                                      # P0: approved changes, stale/abandoned proposals
+            t2 = time.perf_counter()
             for wf in self.specs:
-                routine = self.store.now_minute - self.last_eval.get(wf, -10**9) >= self.pol.eval_interval_minutes
-                if routine:
+                self.safety(wf)                                   # P0: incidents
+            t3 = time.perf_counter()
+            due = sorted((wf for wf in self.specs if self.store.now_minute - self.last_eval.get(wf, -10**9) >= self.pol.eval_interval_minutes),
+                         key=lambda w: self.last_eval.get(w, -10**9))
+            if backlog == 0:                                      # P2/P3 are deferred while evidence is incomplete
+                for wf in due[: self.pol.max_routine_evals_per_tick]:
                     self.last_eval[wf] = self.store.now_minute
-                self.evaluate(wf, routine)
+                    self.plan_routine(wf)
             self.followups()
-            lag = time.perf_counter() - t0
-            self.store.metric("decision_lag_seconds", lag)
-            self.store.metric("open_proposals", self.store.one("SELECT COUNT(*) n FROM proposals WHERE state IN ('PENDING','APPROVED','PLANNED')")["n"])
-            self.store.metric("open_incidents", self.store.one("SELECT COUNT(*) n FROM incidents WHERE state NOT IN ('RESOLVED','ESCALATED')")["n"])
-            self.store.metric("credits_remaining", self.inc.credits or 0)
-            self.store.metric("sim_http_errors", self.client.stats["errors"])
-            if finished:
+            t4 = time.perf_counter()
+            m = self.store.metric
+            m("ingest_backlog_chunks", backlog)
+            m("t_ingest_seconds", t1 - t0)
+            m("t_governance_seconds", t2 - t1)
+            m("t_incident_seconds", t3 - t2)
+            m("t_planning_seconds", t4 - t3)
+            m("decision_lag_seconds", t4 - t1)                    # everything except ingestion
+            m("step_seconds", t4 - t0)
+            m("routine_due", len(due))
+            m("rss_mb", rss_mb())
+            m("db_mb", sum(os.path.getsize(f) for f in (self.store.path, self.store.path + "-wal") if os.path.exists(f)) / 1e6)
+            m("open_proposals", self.store.one("SELECT COUNT(*) n FROM proposals WHERE state IN ('PENDING','APPROVED','PLANNED')")["n"])
+            m("open_incidents", self.store.one("SELECT COUNT(*) n FROM incidents WHERE state NOT IN ('RESOLVED','ESCALATED')")["n"])
+            m("credits_remaining", self.inc.credits or 0)
+            m("sim_http_errors", self.client.stats["errors"])
+            m("sim_http_retries", self.client.stats["retries"])
+            if finished and backlog == 0:
                 break
         self.store.audit("controller_done", f"scenario finished at {self.store.now_ts}; controller exiting cleanly")
         return 0
+
+
+def rss_mb() -> float:
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
 
 
 def world_key(client: SimClient) -> str:

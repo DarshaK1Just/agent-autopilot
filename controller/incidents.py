@@ -28,6 +28,7 @@ class Incidents:
 
     def _ledger(self, wf, kind, amount, purpose, balance):
         self.credits = balance
+        self.s.put("credits_seen", balance)
         self.s.run("INSERT INTO credits(minute,wf,kind,amount,balance,purpose) VALUES(?,?,?,?,?,?)",
                    (self.s.now_minute, wf, kind, amount, balance, purpose))
 
@@ -68,7 +69,7 @@ class Incidents:
             return None
         h0 = min(b0 * 1.25 + 0.001, 0.5)
         p = stats.binom_sf(k, n, h0)
-        hit = p < pol.inc_alpha and k / n >= pol.inc_rel * b0
+        hit = p < pol.inc_tail_prob and k / n >= pol.inc_rate_ratio * b0
         prev = self.s.get(f"inc_hit:{ctx.wf}")
         if not hit:
             self.s.put(f"inc_hit:{ctx.wf}", None)
@@ -82,7 +83,7 @@ class Incidents:
             return None
         evd = {"prompt": cur, "since_version": since, "flagged": k, "connected": n, "rate": round(k / n, 4),
                "baseline_rate": round(b0, 4), "baseline_n": nb, "h0_rate": round(h0, 4), "p_value": p,
-               "rule": f"P(X>={k} | n={n}, p={h0:.4f}) < {pol.inc_alpha} and rate >= {pol.inc_rel}x baseline, on two looks >=45min apart"}
+               "rule": f"P(X>={k} | n={n}, p={h0:.4f}) < {pol.inc_tail_prob} and rate >= {pol.inc_rate_ratio}x baseline, on two looks >=45min apart"}
         data = {"bad_prompt": cur, "since_version": since, "candidates": {}, "failed": [], "llm_rounds": 0, "ref": None}
         with self.s.tx():
             self.s.run("INSERT INTO incidents(id,wf,kind,state,opened_minute,evidence,data) VALUES(?,?,?,?,?,?,?)",

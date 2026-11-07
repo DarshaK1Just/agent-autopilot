@@ -620,3 +620,108 @@ def test_winner_that_still_wins_is_kept_even_if_below_its_promotion_lift(store):
     from controller.planner import plan_lever
     ctx = _promoted(store, (1000, 590), (200, 108))  # +5pts now, promoted at +9pts: smaller, but still a clear win
     assert plan_lever(ctx, "welcome_message", held=False) == []
+
+
+# ----------------------------------------------------------------------------- two-stage promotion
+def _exploring(store, v2=(500, 280), v3=(500, 262), ctl=(1000, 500), start_ver=2):
+    from controller.planner import save_exp
+    cfg = copy.deepcopy(CFG)
+    cfg["allocations"]["default"]["voice"] = {"V1": 0.5, "V2": 0.25, "V3": 0.25}
+    spec = copy.deepcopy(SPEC)
+    spec["options"]["voice"] = ["V1", "V2", "V3"]
+    save_exp(store, "w1", "voice", {"scopes": {"default": {"phase": "EXPLORING", "control": "V1", "start_ver": start_ver}}, "retired": {}, "dropped": {}})
+    store.run("INSERT INTO agg VALUES('w1',-5,1,'default','voice','V1','all','',6000,2000,1000)")
+    for opt, (conn, eng) in (("V1", ctl), ("V2", v2), ("V3", v3)):
+        store.run("INSERT INTO agg VALUES('w1',5,2,'default','voice',?,'all','',?,?,?)", (opt, conn * 3, conn, eng))
+    return WfCtx(store, spec, cfg, 2, 2 * 1440, 10 * 1440, POL)
+
+
+def test_first_look_winner_gets_a_provisional_split_that_keeps_unresolved_arms(store):
+    from controller.planner import plan_lever
+    ctx = _exploring(store, v2=(500, 290))  # V2 clearly ahead of control 0.50 -> 0.58
+    (intent,) = plan_lever(ctx, "voice", held=False)
+    d = intent.patch["allocations"]["default"]["voice"]
+    assert intent.exp_update["dims"]["voice"]["scopes"]["default"]["phase"] == "CONFIRMING"
+    assert d["V2"] == pytest.approx(0.5) and d["V3"] > 0 and d["V1"] > 0  # no collapse, V3 is still explored
+
+
+def _confirming(store, fresh_w, fresh_c):
+    from controller.planner import save_exp
+    cfg = copy.deepcopy(CFG)
+    cfg["allocations"]["default"]["voice"] = {"V2": 0.5, "V1": 0.25, "V3": 0.25}
+    spec = copy.deepcopy(SPEC)
+    spec["options"]["voice"] = ["V1", "V2", "V3"]
+    save_exp(store, "w1", "voice", {"scopes": {"default": {"phase": "CONFIRMING", "winner": "V2", "control": "V1", "start_ver": 3, "promo_lift": 0.08}},
+                                    "retired": {}, "dropped": {}})
+    store.run("INSERT INTO agg VALUES('w1',-5,1,'default','voice','V1','all','',6000,2000,1000)")
+    for opt, (conn, eng) in (("V2", fresh_w), ("V1", fresh_c)):
+        store.run("INSERT INTO agg VALUES('w1',8,3,'default','voice',?,'all','',?,?,?)", (opt, conn * 3, conn, eng))
+    return WfCtx(store, spec, cfg, 3, 3 * 1440, 10 * 1440, POL)
+
+
+def test_provisional_winner_is_confirmed_only_by_fresh_data(store):
+    from controller.planner import plan_lever
+    ctx = _confirming(store, (800, 440), (400, 200))  # fresh: 0.55 vs 0.50, 800/400 trials
+    (intent,) = plan_lever(ctx, "voice", held=False)
+    assert intent.kind == "confirm"
+    assert intent.patch["allocations"]["default"]["voice"]["V2"] == pytest.approx(1 - POL.holdout_share)
+
+
+def test_provisional_winner_that_does_not_replicate_is_withdrawn(store):
+    from controller.planner import plan_lever
+    ctx = _confirming(store, (800, 380), (400, 200))  # fresh: 0.475 vs 0.50 -> the first look was luck
+    (intent,) = plan_lever(ctx, "voice", held=False)
+    assert intent.kind == "unconfirmed" and intent.urgent
+    assert intent.exp_update["dims"]["voice"]["retired"] == {"V2": ctx.minute}
+
+
+def test_unreplicated_winner_waits_when_fresh_data_is_thin(store):
+    from controller.planner import plan_lever
+    assert plan_lever(_confirming(store, (100, 60), (50, 25)), "voice", held=False) == []
+
+
+# ----------------------------------------------------------------------------- dimension-aware concurrency
+def test_urgent_change_supersedes_routine_proposal_on_the_same_dimension(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    gov = _gov(store, FakeSim())
+    gov.propose(_ctx(store), [_intent()])  # routine, touches voice
+    urgent_same = Intent("u", "unconfirmed", "w1", ("voice",), {"allocations": {"default": {"voice": {"V1": 0.7, "V2": 0.3}}}}, "s", "r", {},
+                         urgent=True, protective=True)
+    assert gov.propose(_ctx(store), [urgent_same]) is not None
+    states = {r["state"] for r in store.q("SELECT state FROM proposals")}
+    assert "ABANDONED" in states and len(gov.in_flight("w1")) == 1
+
+
+def test_only_one_urgent_proposal_per_workflow(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    gov = _gov(store, FakeSim())
+    one = Intent("u1", "prompt_fix", "w1", ("prompt_version",), {"prompt_version": "P3"}, "s", "r", {}, urgent=True, protective=True, validation_run_id="v1")
+    two = Intent("u2", "unconfirmed", "w1", ("voice",), {"allocations": {"default": {"voice": {"V1": 1.0}}}}, "s", "r", {}, urgent=True, protective=True)
+    assert gov.propose(_ctx(store), [one]) is not None
+    assert gov.propose(_ctx(store), [two]) is None
+
+
+# ----------------------------------------------------------------------------- loop budgets / startup safety
+def test_ingest_budget_leaves_backlog_for_the_next_tick(store):
+    from controller.main import Controller
+    lines = [[_lead(1), _call(2)], [_call(3)], [_call(4)], [_call(5)], [_call(6)], [_call(7)]]
+    ing, fake = make_ingestor(store, lines)
+    c = Controller.__new__(Controller)
+    c.store, c.ing, c.pol, c.specs = store, ing, POL, {"w1": SPEC}
+    c.handle_control_events = lambda: None
+    assert c.ingest_pending() == 2  # 6 pending, budget 4 -> 2 left; routine planning is deferred while this is non-zero
+    assert c.ingest_pending() == 0
+
+
+def test_unrecorded_credit_spend_is_detected_after_restart(store):
+    from controller.main import Controller
+    store.put("credits_seen", 195.0)
+    c = Controller.__new__(Controller)
+    c.store, c.pol, c.specs, c.cfgs = store, POL, {}, {}
+    c.client = type("C", (), {"state": lambda s: {"ts": "2027-01-04T00:00:00+05:30", "sim_minute": 0, "end_minute": 100, "credits_remaining": 190.0},
+                              "workflows": lambda s: []})()
+    c.ing = type("I", (), {"set_d0": lambda *a: None})()
+    c.inc = type("N", (), {})()
+    c.reconcile = lambda: None
+    c.startup()
+    assert store.one("SELECT summary FROM audit WHERE kind='credit_spend_unrecorded'") is not None
