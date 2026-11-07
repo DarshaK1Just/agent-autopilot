@@ -140,7 +140,7 @@ class Governor:
         d = cfgutil.diff(ctx.cfg, new)
         gain = max(i.expected_rel_lift * i.pop_share * i.confidence for i in intents)
         impact = max(0.01, min(1.0, round(1 - math.exp(-gain / 0.03), 3)))
-        if any(i.urgent for i in intents):
+        if any(i.kind == "prompt_fix" for i in intents):
             impact = max(impact, 0.9)
         dry = {i.kind: i.dry_run for i in intents if i.dry_run} or {"note": "no historical replay possible for this change",
                                                                       "reason": "operational change without recorded counterfactual"}

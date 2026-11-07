@@ -66,7 +66,7 @@ class Incidents:
         if n < pol.inc_min_conn or k < pol.inc_min_flags:
             self.s.put(f"inc_hit:{ctx.wf}", None)
             return None
-        h0 = min(b0 * 1.5 + 0.002, 0.5)
+        h0 = min(b0 * 1.25 + 0.001, 0.5)
         p = stats.binom_sf(k, n, h0)
         hit = p < pol.inc_alpha and k / n >= pol.inc_rel * b0
         prev = self.s.get(f"inc_hit:{ctx.wf}")
@@ -227,6 +227,12 @@ class Incidents:
                     self._save(inc, data, "VERIFYING")
                     self.s.audit("incident_fix_applied", f"prompt {data['fix']} live at v{version}; verifying", wf=prop["wf"],
                                  ref=iid, proposal_id=prop["pid"])
+
+    def reopen(self, wf: str):
+        """A fix that could not be submitted yet (approver offline, budget) goes back to OPEN; validation is kept."""
+        inc = self.s.one("SELECT * FROM incidents WHERE wf=? AND state='PROPOSING'", (wf,))
+        if inc:
+            self._save(inc, json.loads(inc["data"]), "OPEN")
 
     def on_failed(self, prop: dict, state: str):
         for it in json.loads(prop["intent_keys"] or "[]"):

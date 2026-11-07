@@ -11,10 +11,11 @@ class Policy:
     min_trials_slice: int = 200
     rel_min_lift: float = 0.03             # practical significance: >= 3% relative
     rel_harm: float = 0.02                 # arm is harmful if credibly worse than control by 2% relative
-    family_alpha: float = 0.05             # familywise error budget across challenger arms (Sidak)
+    family_alpha: float = 0.10             # familywise error budget across challenger arms (Sidak)
     slice_confidence: float = 0.975        # posterior probability for slice-level wins (after EB shrinkage)
     harm_confidence: float = 0.95
-    het_alpha: float = 0.05                # familywise level for 'does the effect differ across slices' (Bonferroni over features x options)
+    futility_p: float = 0.10               # prune an arm when P(arm beats control) <= 10% with enough data
+    het_alpha: float = 0.10                # familywise level for 'does the effect differ across slices' (Bonferroni over features x options)
     min_cohort_share: float = 0.08         # a cohort must cover >= 8% of traffic
     min_cohort_gain: float = 0.004         # and add >= 0.4pt absolute KPI to be worth a config object
     max_cohorts: int = 6
@@ -39,7 +40,7 @@ class Policy:
     # --- incidents
     inc_min_conn: int = 150
     inc_min_flags: int = 5
-    inc_alpha: float = 1e-3
+    inc_alpha: float = 3e-3
     inc_rel: float = 2.0
     inc_val_n: int = 500
     credit_reserve: float = 60.0           # never spend the last N credits on anything but incidents

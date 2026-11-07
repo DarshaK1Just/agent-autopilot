@@ -153,7 +153,8 @@ class Controller:
             return
         urgent = self.inc.respond(ctx)
         if urgent:
-            self.gov.propose(ctx, urgent)
+            if self.gov.propose(ctx, urgent) is None:
+                self.inc.reopen(wf)
             return
         if not routine or self.inc.active(wf):
             return

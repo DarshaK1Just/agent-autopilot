@@ -237,7 +237,8 @@ def _decide(ctx: WfCtx, counts: dict, opts: list[str], ctl: str, retired: dict):
             continue
         dmin, dh = pol.rel_min_lift * c.rate_ctl, pol.rel_harm * c.rate_ctl
         p_win, p_harm = c.p_greater(dmin), 1.0 - c.p_greater(-dh)
-        row = {**_contrast_row(c), "p_lift_gt_min": round(p_win, 4), "p_harm": round(p_harm, 4), "need": round(need, 4)}
+        row = {**_contrast_row(c), "p_lift_gt_min": round(p_win, 4), "p_harm": round(p_harm, 4), "need": round(need, 4),
+               "p_better": round(c.p_greater(0.0), 4)}
         if p_harm >= pol.harm_confidence:
             row["status"] = "harmful"
             harm.append(o)
@@ -247,6 +248,8 @@ def _decide(ctx: WfCtx, counts: dict, opts: list[str], ctl: str, retired: dict):
             row["status"] = "winner" if ok else "guardrail_blocked"
             if ok:
                 win.append((c.diff, o))
+        elif c.p_greater(0.0) <= pol.futility_p:
+            row["status"] = "futile"
         else:
             row["status"] = "undecided"
         rows[o] = row
@@ -274,11 +277,13 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         upd_scopes["default"] = {"phase": "PROMOTED", "winner": w, "control": ctl, "start_ver": "$V",
                                  "promo_minute": ctx.minute, "promo_lift": rows[w]["diff"]}
         kinds.append("promote")
-    elif harm:
-        target = cfgutil.clean_dist({o: wgt for o, wgt in cur.items() if o not in harm})
-        if target and cfgutil.tv(cur, target) > 0.02:
+    else:
+        futile = [o for o, r in rows.items() if r["status"] == "futile"]
+        drop = harm + futile
+        target = cfgutil.clean_dist({o: wgt for o, wgt in cur.items() if o not in drop})
+        if drop and len(target) >= 2 and cfgutil.tv(cur, target) > 0.02:
             patch["allocations"]["default"] = {dim: target}
-            kinds.append("harm_stop")
+            kinds.append("harm_stop" if harm else "prune")
     # heterogeneity: single partition axis, single-value cohorts, EB-shrunk per-slice effects
     c_int = _cohort_candidates(ctx, dim, st, ds, a0, harm)
     if c_int:
@@ -306,6 +311,8 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         summary_bits.append(f"Promote {dim} {a0} (+{rows[a0]['diff']:.3f} abs {ctx.primary})")
     if "harm_stop" in kinds:
         summary_bits.append(f"Stop harmful {dim} options {harm}")
+    if "prune" in kinds:
+        summary_bits.append(f"Drop futile {dim} options {[o for o, r in rows.items() if r['status'] == 'futile']} to concentrate traffic")
     if "cohort" in kinds:
         summary_bits.append(f"Tailor {dim} for cohorts {', '.join(cohorts_add)}")
     conf = rows[a0]["p_lift_gt_min"] if win else max([e[2]["p_best"] for e in c_int.values()] or [0.5])
@@ -316,7 +323,7 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
                    {**dims_note, "cohorts": {c: e for c, (_, _, e) in c_int.items()}},
                    expected_rel_lift=lift if lift else max([e[2]["post_mean"] / max(ctx.prior, 1e-6) for e in c_int.values()] or [0]),
                    pop_share=1.0 if win else sum(e[2]["share"] for e in c_int.values()), confidence=conf,
-                   protective=("promote" not in kinds and "cohort" not in kinds),
+                   protective=("promote" not in kinds and "cohort" not in kinds), urgent=("harm_stop" in kinds),
                    exp_update={"dims": {dim: {"scopes": upd_scopes}}, "cohorts_add": cohorts_add}, dry_run=dry)]
 
 
@@ -425,7 +432,7 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
     return [Intent(ctx.okey("rollback", dim, sorted(upd)), "rollback", ctx.wf, (dim,), out_patch,
                    "Roll back decayed winner: " + "; ".join(reasons),
                    "Winner no longer beats its holdout over the recent window; reverting to the control and re-exploring.",
-                   evd, protective=True, confidence=0.8, expected_rel_lift=0.02,
+                   evd, protective=True, urgent=True, confidence=0.8, expected_rel_lift=0.02,
                    exp_update={"dims": {dim: {"scopes": upd, "retired": {s_["winner"]: ctx.minute for sc, s_ in st["scopes"].items() if sc in upd}}}})]
 
 
