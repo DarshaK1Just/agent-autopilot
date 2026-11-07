@@ -725,3 +725,37 @@ def test_unrecorded_credit_spend_is_detected_after_restart(store):
     c.reconcile = lambda: None
     c.startup()
     assert store.one("SELECT summary FROM audit WHERE kind='credit_spend_unrecorded'") is not None
+
+
+# ----------------------------------------------------------------------------- caller ID
+def _did_ctx(store, rows, cur):
+    spec = copy.deepcopy(SPEC)
+    spec["options"]["caller_id"] = ["D1", "D2", "D3", "D4"]
+    cfg = copy.deepcopy(CFG)
+    cfg["allocations"]["default"]["caller_id"] = cur
+    for opt, (dials, conn) in rows.items():
+        store.run("INSERT INTO agg VALUES('w1',7,2,'default','caller_id',?,'all','',?,?,0)", (opt, dials, conn))
+    return WfCtx(store, spec, cfg, 2, 8 * 360, 10 * 1440, POL)
+
+
+def test_unmeasured_caller_ids_are_not_treated_as_healthy(store):
+    from controller.planner import plan_caller_id
+    cur = {"D1": 0.42, "D2": 0.42, "D3": 0.08, "D4": 0.08}
+    ctx = _did_ctx(store, {"D1": (3000, 780), "D2": (3000, 790), "D3": (170, 20), "D4": (180, 22)}, cur)
+    assert plan_caller_id(ctx, -10**9) == []  # D3/D4 stay at their probe share; no "re-spread" onto unjudged IDs
+
+
+def test_degraded_caller_id_is_cut_to_the_floor_and_siblings_keep_their_share(store):
+    from controller.planner import plan_caller_id
+    cur = {"D1": 0.25, "D2": 0.25, "D3": 0.25, "D4": 0.25}
+    ctx = _did_ctx(store, {"D1": (1800, 470), "D2": (1900, 500), "D3": (400, 105), "D4": (410, 60)}, cur)
+    (intent,) = plan_caller_id(ctx, -10**9)
+    d = intent.patch["allocations"]["default"]["caller_id"]
+    assert d["D4"] == pytest.approx(POL.did_floor_share) and intent.protective and d["D1"] > 0.25
+
+
+def test_one_noisy_caller_id_with_little_data_is_ignored(store):
+    from controller.planner import plan_caller_id
+    cur = {"D1": 0.42, "D2": 0.42, "D3": 0.08, "D4": 0.08}
+    ctx = _did_ctx(store, {"D1": (3000, 780), "D2": (60, 5)}, cur)  # D2 looks terrible, but on 60 dials
+    assert plan_caller_id(ctx, -10**9) == []

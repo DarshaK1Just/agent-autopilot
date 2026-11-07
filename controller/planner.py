@@ -516,7 +516,8 @@ def plan_caller_id(ctx: WfCtx, last_change_minute: int) -> list[Intent]:
             bad.append(o)
     still_bad = [o for o in known_bad if o not in recovered]
     bad = bad + [o for o in still_bad if o not in bad]
-    untested = [o for o in opts if o not in tested and o not in bad and cur.get(o, 0) < pol.did_probe_share]
+    # An ID without enough data is unmeasured, not healthy: it stays at the probe share until it has been judged.
+    untested = [o for o in opts if o not in tested and o not in bad]
     healthy = [o for o in opts if o not in bad]
     if not healthy:
         return []
