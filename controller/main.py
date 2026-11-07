@@ -13,7 +13,7 @@ from .client import SimClient, SimError, SimUnavailable
 from .governance import Governor
 from .incidents import Incidents
 from .ingest import Ingestor
-from .planner import LEVERS, WfCtx, plan_caller_id, plan_lever, plan_schedule
+from .planner import LEVERS, WfCtx, apply_exp_update, plan_caller_id, plan_lever, plan_schedule
 from .policy import Policy
 from .store import Store
 
@@ -167,10 +167,10 @@ class Controller:
             intents += plan_caller_id(ctx, (last["m"] or -10**9))
         if "schedule" not in held and "cohorts" not in held:
             intents += plan_schedule(ctx)
+        for i in [i for i in intents if not i.patch and i.exp_update]:
+            apply_exp_update(self.store, wf, i.exp_update, ctx.version)  # state-only: no config change, no proposal
+            self.store.audit("experiment_reset", i.summary, wf=wf, detail=i.evidence)
         intents = [i for i in intents if i.patch]
-        for i in intents:
-            if i.exp_update and not i.patch and i.kind == "exp_reset":
-                pass
         if intents:
             self.gov.propose(ctx, intents)
 
@@ -183,7 +183,6 @@ class Controller:
             if not p:
                 continue
             b = r["m"] // ev.BLK
-            pre = ev.recent_rate  # noqa: F841
             def window(lo, hi):
                 x = self.store.one("SELECT SUM(dials) d, SUM(conn) c, SUM(eng) e FROM agg WHERE wf=? AND dim='voice' AND sl='all' AND blk>=? AND blk<?",
                                    (r["wf"], lo, hi))

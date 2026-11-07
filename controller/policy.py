@@ -6,6 +6,7 @@ from dataclasses import dataclass
 class Policy:
     # --- experiments
     explore_control_share: float = 0.4     # incumbent keeps >= 40% while arms are explored
+    human_incumbent_share: float = 0.7     # when a supervisor chose the incumbent, challengers get at most 30% in total
     holdout_share: float = 0.15            # promoted winner keeps this much on the incumbent for decay detection
     min_trials_arm: int = 250              # KPI denominators per arm before any verdict
     min_trials_slice: int = 200

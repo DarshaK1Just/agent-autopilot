@@ -1,0 +1,47 @@
+# Controller runbook
+
+## Run
+```bash
+pip install -r requirements.txt                      # numpy, httpx (+ sim deps); nothing else is needed
+python -m sim serve --scenario scenarios/public_01_dev.yaml --run-dir runs/mine --force
+./run.sh http://127.0.0.1:8700                      # state in ./controller_state.db (override: CONTROLLER_DB=...)
+python -m pytest -q tests
+scripts/run_scenario.sh 01_dev                      # serve + run + grade -> reports/public_01.md  (needs runs/base_public_<name> from `make baseline`)
+.venv/bin/python scripts/crash_demo.py --kills 4    # SIGKILL/restart demo -> reports/crash_recovery.md
+```
+Re-running `./run.sh` against the same simulator and the same DB resumes; against a fresh simulator use a fresh DB.
+
+## Layout
+| file | role |
+|---|---|
+| `client.py` | HTTP client; only reads are auto-retried; side-effecting calls reconcile instead of resend |
+| `store.py` | SQLite schema, `tx()`, `audit()`; the only durable state |
+| `ingest.py` | chunk → integer columns → numpy group-by → additive counters + cursor in **one** transaction |
+| `evidence.py`, `stats.py` | read-side queries; pure deterministic statistics (no RNG) |
+| `planner.py` | experiments (explore → promote/prune/harm-stop/cohorts → decay watch), caller-ID health, cohort schedules; emits `Intent`s |
+| `incidents.py` | hallucination detect → candidate → validate → propose → verify; owns credit spending |
+| `governance.py` | proposal state machine, routing (approval vs auto), TTL/hours/fatigue gating, reconciliation |
+| `main.py` | the loop; supervisor-edit detection and holds |
+| `cli.py` | `explain`, `proposal`, `supervisor`, `health`, `log` |
+| `policy.py` | every threshold |
+
+## Data flow
+`advance → ingest new chunks (cursor) → refresh configs/holds → governance.reconcile (poll/apply) → per workflow: incidents.check/verify/respond, then every 2 sim-hours planners → Intents → one batched proposal → approval or auto-apply`.
+Planners are pure functions of (aggregates, current config, small experiment memory), so supervisor edits and restarts only change their inputs.
+
+## Operating it
+```bash
+python -m controller.cli --db controller_state.db supervisor     # one screen: testing / winning / waiting on you / changed today
+python -m controller.cli --db controller_state.db explain --wf nw_renewal --at "D3 14:00"
+python -m controller.cli --db controller_state.db health
+python -m controller.cli --db controller_state.db log --wf ks_cancel --limit 60
+```
+**Page on:** a proposal stuck `PLANNED` > 2h (simulator unreachable or rejecting), `incident_escalated`, `credit_skip`, ingest failing for > 30 min of wall time, process not advancing.
+**Do not page on:** rejected/expired proposals (re-planned automatically), `deferred` (waiting for approver hours), supervisor edits, single failed HTTP calls (retried).
+
+## Invariants
+1. Ingest cursor and counters commit together. 2. A proposal row is `PLANNED` before any request; its id is `wf-v<base>-<config fingerprint>[-rN]`. 3. A change is applied at most once: apply is only attempted from `APPROVED`, and `not_approved` / `duplicate_proposal_id` are reconciled against `/approvals` and config history. 4. Experiment state advances only when its proposal is **applied**. 5. One in-flight proposal per workflow. 6. Customer-facing changes never auto-apply unless protective.
+
+## Known sharp edges
+- Credits spent between the simulator charging and our commit are lost on a crash at that exact instant (the result is not retrievable).
+- `lead_id → features` is held in memory (bounded by cadence window) and rebuilt from SQLite on start.

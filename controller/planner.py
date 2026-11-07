@@ -81,7 +81,9 @@ class WfCtx:
 def load_exp(ctx: WfCtx, dim: str) -> dict:
     eid = f"{ctx.wf}:{dim}"
     r = ctx.store.one("SELECT state FROM experiments WHERE id=?", (eid,))
-    return json.loads(r["state"]) if r else {"scopes": {}, "retired": {}}
+    st = json.loads(r["state"]) if r else {"scopes": {}, "retired": {}}
+    st.setdefault("dropped", {})  # options judged harmful/futile for this lever: never offered again
+    return st
 
 
 def save_exp(store: Store, wf: str, dim: str, st: dict, phase: str = "ACTIVE"):
@@ -106,6 +108,7 @@ def apply_exp_update(store: Store, wf: str, upd: dict, version: int):
             else:
                 st["scopes"].setdefault(scope, {}).update(s)
         st["retired"].update(patch.get("retired", {}))
+        st.setdefault("dropped", {}).update(patch.get("dropped", {}))
         save_exp(store, wf, dim, st)
     for cid, (where, evd) in upd.get("cohorts_add", {}).items():
         store.run("INSERT OR REPLACE INTO cohorts(wf,cid,where_json,status,evidence,created_minute) VALUES(?,?,?,?,?,?)",
@@ -198,22 +201,25 @@ def plan_lever(ctx: WfCtx, dim: str, held: bool) -> list[Intent]:
 
 
 def _start_explore(ctx: WfCtx, dim: str, st: dict, cur_def: dict) -> list[Intent]:
-    pol, opts = ctx.pol, ctx.spec["options"][dim]
+    pol = ctx.pol
     ctl = cfgutil.modal(cur_def)
+    opts = [o for o in ctx.spec["options"][dim] if o == ctl or o not in st["dropped"]]
     k = len(opts)
-    share = 1.0 / k if k else 1
-    ctl_w = max(pol.explore_control_share, 1.0 / k)
+    if k < 2:
+        return []
+    human = ctx.store.one("SELECT 1 FROM holds WHERE wf=? AND dim=? AND reason LIKE 'supervisor%'", (ctx.wf, dim)) is not None
+    base_share = pol.human_incumbent_share if human else pol.explore_control_share
+    ctl_w = max(base_share, 1.0 / k)
     arm_share = (1 - ctl_w) / (k - 1)
     n_exp = den_per_day(ctx) * arm_share * ctx.days_left * 0.5
     if n_exp < pol.min_trials_arm:
-        return [Intent(ctx.okey("skip", dim), "exp_skip", ctx.wf, (), {}, f"{dim}: exploration not worth it",
-                       f"expected {n_exp:.0f} trials per arm over remaining horizon < {pol.min_trials_arm}",
-                       {"den_per_day": den_per_day(ctx), "days_left": ctx.days_left})] if False else []
-    target = explore_dist(opts, ctl, pol.explore_control_share)
+        return []  # the scenario is too short / too quiet for this test to ever reach a verdict
+    target = explore_dist(opts, ctl, base_share)
     if cfgutil.tv(cur_def, target) < 0.05:
         return []
     ev_ = {"control": ctl, "options": opts, "den_per_day": round(den_per_day(ctx)),
-           "expected_trials_per_arm": round(n_exp), "history_note": "history has no variant variation; no priors on options"}
+           "expected_trials_per_arm": round(n_exp), "history_note": "history has no variant variation; no priors on options",
+           "incumbent_chosen_by_supervisor": human}
     return [Intent(ctx.okey("explore", dim, ctl, target), "explore", ctx.wf, (dim,),
                    {"allocations": {"default": {dim: target}}},
                    f"Test {dim} options {', '.join(o for o in opts if o != ctl)} against {ctl}",
@@ -261,7 +267,7 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
     ds = st["scopes"]["default"]
     ctl = ds["control"]
     counts = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=ds["start_ver"], cohs=["default"])
-    rows, win, harm = _decide(ctx, counts, opts, ctl, st["retired"])
+    rows, win, harm = _decide(ctx, counts, [o for o in opts if o not in st["dropped"]], ctl, st["retired"])
     cur = cfgutil.dist(ctx.cfg, "default", dim)
     patch: dict = {"allocations": {}}
     upd_scopes: dict = {}
@@ -285,7 +291,8 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
             patch["allocations"]["default"] = {dim: target}
             kinds.append("harm_stop" if harm else "prune")
     # heterogeneity: single partition axis, single-value cohorts, EB-shrunk per-slice effects
-    c_int = _cohort_candidates(ctx, dim, st, ds, a0, harm)
+    futile_now = [o for o, r in rows.items() if r["status"] == "futile"]
+    c_int = _cohort_candidates(ctx, dim, st, ds, a0, set(harm) | set(futile_now) | set(st["dropped"]))
     if c_int:
         patch["cohorts_add"] = [{"id": cid, "where": w} for cid, (w, _, _) in c_int.items()]
         for cid, (w, dist, evd) in c_int.items():
@@ -324,14 +331,16 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
                    expected_rel_lift=lift if lift else max([e[2]["post_mean"] / max(ctx.prior, 1e-6) for e in c_int.values()] or [0]),
                    pop_share=1.0 if win else sum(e[2]["share"] for e in c_int.values()), confidence=conf,
                    protective=("promote" not in kinds and "cohort" not in kinds), urgent=("harm_stop" in kinds),
-                   exp_update={"dims": {dim: {"scopes": upd_scopes}}, "cohorts_add": cohorts_add}, dry_run=dry)]
+                   exp_update={"dims": {dim: {"scopes": upd_scopes,
+                                              "dropped": {o: ctx.minute for o in (harm + futile_now) if "harm_stop" in kinds or "prune" in kinds}}},
+                               "cohorts_add": cohorts_add}, dry_run=dry)]
 
 
 def _axis(ctx: WfCtx) -> str | None:
     return ctx.store.get(f"axis:{ctx.wf}")
 
 
-def _cohort_candidates(ctx: WfCtx, dim: str, st: dict, ds: dict, a0: str, harm: list[str]) -> dict:
+def _cohort_candidates(ctx: WfCtx, dim: str, st: dict, ds: dict, a0: str, bad_opts: set) -> dict:
     """Return {cohort_id: (where, allocation, evidence)} for slices whose best option differs materially from
     the workflow-wide action `a0`. Per-slice effects are partially pooled (empirical Bayes) per option."""
     pol, opts, ctl = ctx.pol, ctx.spec["options"][dim], ds["control"]
@@ -354,12 +363,14 @@ def _cohort_candidates(ctx: WfCtx, dim: str, st: dict, ds: dict, a0: str, harm: 
             cv = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=ds["start_ver"], cohs=["default"], sl=F, sv=v)
             shares[v] = ev.totals(cv)[1] / max(tot_conn, 1)
             for o in opts:
-                if o == a0:
+                if o == a0 or o in bad_opts:
                     continue
                 c = ev.stratified(cv, o, a0, ctx.primary, ctx.prior)
                 if c and min(c.n_arm, c.n_ctl) >= pol.min_trials_slice:
                     per_opt.setdefault(o, []).append((v, c))
         decisions: dict[str, tuple] = {}
+        n_cand = max(sum(len(lst) for lst in per_opt.values()), 1)
+        need = max(pol.slice_confidence, 1.0 - pol.family_alpha / n_cand)  # Bonferroni over this feature's candidate (slice, option) pairs
         for o, lst in per_opt.items():
             if stats.heterogeneity_p([(c.diff, c.sd) for _, c in lst]) >= pol.het_alpha / (len(FEATURES) * max(len(opts) - 1, 1)):
                 continue  # no evidence the effect differs across this feature's values: do not slice on it
@@ -369,7 +380,7 @@ def _cohort_candidates(ctx: WfCtx, dim: str, st: dict, ds: dict, a0: str, harm: 
                 p_win = 1.0 - stats.phi((dmin - pm) / ps)
                 p_harm = stats.phi((-pol.rel_harm * c.rate_ctl - pm) / ps)
                 cur = decisions.get(v)
-                if p_win >= pol.slice_confidence and shares[v] >= pol.min_cohort_share and pm >= pol.min_cohort_gain:
+                if p_win >= need and shares[v] >= pol.min_cohort_share and pm >= pol.min_cohort_gain:
                     if cur is None or pm > cur[1]:
                         decisions[v] = (o, pm, p_win, "win", tau, c)
         score = sum(shares[v] * d[1] for v, d in decisions.items())
@@ -417,7 +428,7 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         evd[scope] = {"recent": _contrast_row(cr), "p_still_winning": round(p_still, 3), "promo_lift": s.get("promo_lift"),
                       "whole": _contrast_row(cw) if cw else None, "window_blocks": pol.decay_window_blocks}
         if p_still <= pol.decay_p or p_harm >= pol.harm_confidence:
-            others = [o for o in opts if o not in (w, ctl)]
+            others = [o for o in opts if o not in (w, ctl) and o not in st['dropped']]
             if scope == "default":
                 target = cfgutil.clean_dist({ctl: 0.7, **{o: 0.3 / len(others) for o in others}}) if others else {ctl: 1.0}
                 out_patch["allocations"]["default"] = {dim: target}
@@ -599,21 +610,18 @@ def plan_schedule(ctx: WfCtx) -> list[Intent]:
 
 
 def _best_schedule_axis(ctx: WfCtx) -> str | None:
-    best, best_s = None, 0.0
+    """Feature whose values differ most in hourly pickup (only used when no experiment lever exists to pick the axis)."""
+    best, best_spread = None, 0.0
     for F in FEATURES:
         rows = ctx.store.q("SELECT hour, sv, SUM(dials) d, SUM(conn) c FROM hr WHERE wf=? AND sl=? AND day<? GROUP BY hour, sv",
                            (ctx.wf, F, ctx.minute // 1440))
-        s = 0.0
+        by_hour: dict = {}
         for r in rows:
-            if r["c"] > 50:
-                s += abs(math.log(max(r["c"] / max(r["d"], 1), 1e-6)))
-        # fall back to cohort-size-weighted variance of hourly pickup between values
-        by_h: dict = {}
-        for r in rows:
-            by_h.setdefault(r["hour"], []).append(r["c"] / max(r["d"], 1))
-        spread = sum(max(v) - min(v) for v in by_h.values() if len(v) > 1)
-        if spread > best_s:
-            best, best_s = F, spread
+            if r["sv"] != "?" and r["d"] >= 300:
+                by_hour.setdefault(r["hour"], []).append(r["c"] / r["d"])
+        spread = sum(max(v) - min(v) for v in by_hour.values() if len(v) > 1)
+        if spread > best_spread:
+            best, best_spread = F, spread
     if best:
         ctx.store.put(f"axis:{ctx.wf}", best)
     return best
