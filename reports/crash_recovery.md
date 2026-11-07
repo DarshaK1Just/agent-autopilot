@@ -2,15 +2,15 @@
 
 scenario `02_incidents`, SIGKILL x4, seed 7
 
-- kill 1: sim 2027-01-05T10:15:00+05:30, event cursor=38, open proposals at kill=[]
-- kill 2: sim 2027-01-06T07:15:00+05:30, event cursor=79, open proposals at kill=[('nw_kyc-v1-6f8e2a50b05a', 'PENDING'), ('nw_renewal-v3-fb2200a88641', 'PENDING')]
-- kill 3: sim 2027-01-07T22:30:00+05:30, event cursor=148, open proposals at kill=[('nw_kyc-v3-4059785c3fb9', 'PENDING'), ('nw_renewal-v5-bb96b941a35a', 'PENDING')]
-- kill 4: sim 2027-01-09T11:15:00+05:30, event cursor=169, open proposals at kill=[]
+- kill 1: sim 2027-01-04T14:00:00+05:30, event cursor=15, open proposals at kill=[('nw_renewal-v1-874ed436610d', 'PENDING'), ('nw_kyc-v1-155e06fcd024', 'PENDING')]
+- kill 2: sim 2027-01-05T05:15:00+05:30, event cursor=44, open proposals at kill=[('nw_kyc-v1-155e06fcd024', 'PENDING')]
+- kill 3: sim 2027-01-06T16:00:00+05:30, event cursor=92, open proposals at kill=[('nw_kyc-v2-f817dd0d78da', 'PENDING')]
+- kill 4: sim 2027-01-07T05:00:00+05:30, event cursor=113, open proposals at kill=[('nw_kyc-v2-f817dd0d78da', 'PENDING')]
 - final run exit code 0
 
 - controller starts recorded in audit: 5 (4 restarts)
-- approvals in simulator: 16, unique proposal ids: 16
-- proposals by local state: {'APPLIED': 14, 'REJECTED': 2, 'STALE': 1}
+- approvals in simulator: 17, unique proposal ids: 17
+- proposals by local state: {'APPLIED': 13, 'REJECTED': 3, 'ABANDONED': 1, 'PENDING': 1}
 - audit rows: 101 (continuous across restarts)
 - scenario finished: True
 - **violations: none**

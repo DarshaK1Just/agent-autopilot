@@ -4,23 +4,23 @@
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| arav_cancel_2 | 0.360 | +5.5% | 0.244 | -0.1% | 0.527 | +5.3% | 39% | 388 (408) |
-| arav_kyc_1 | 0.430 | +21.4% | 0.251 | +17.0% | 0.595 | -0.1% | 0% | 417 (370) |
-| arav_renewal_0 | 0.473 | +17.7% | 0.278 | +5.1% | 0.601 | +10.6% | 51% | 445 (440) |
-| kest_cancel_2 | 0.362 | +6.9% | 0.244 | +0.2% | 0.527 | +5.8% | 39% | 369 (411) |
-| kest_kyc_1 | 0.472 | +33.5% | 0.272 | +27.3% | 0.595 | +0.1% | 0% | 414 (339) |
-| kest_renewal_0 | 0.460 | +15.2% | 0.273 | +3.8% | 0.593 | +9.4% | 48% | 437 (433) |
-| nort_cancel_2 | 0.361 | +6.6% | 0.243 | +0.2% | 0.528 | +5.9% | 41% | 402 (393) |
-| nort_kyc_1 | 0.475 | +34.2% | 0.275 | +28.9% | 0.596 | +0.1% | 0% | 412 (323) |
-| nort_renewal_0 | 0.457 | +12.9% | 0.271 | +2.9% | 0.593 | +8.3% | 40% | 414 (411) |
-| tide_cancel_2 | 0.358 | +5.6% | 0.243 | -0.5% | 0.524 | +5.0% | 36% | 381 (407) |
-| tide_kyc_1 | 0.437 | +23.6% | 0.255 | +18.9% | 0.594 | +0.4% | 0% | 409 (356) |
-| tide_renewal_0 | 0.471 | +17.5% | 0.276 | +4.5% | 0.602 | +11.0% | 53% | 472 (438) |
-| ALL | 0.426 | +16.8% | 0.260 | +8.3% | 0.575 | +5.7% | 28% | 4960 (4729) |
+| arav_cancel_2 | 0.366 | +7.3% | 0.244 | +0.0% | 0.534 | +6.7% | 47% | 390 (408) |
+| arav_kyc_1 | 0.429 | +21.2% | 0.251 | +17.0% | 0.594 | -0.3% | 0% | 420 (370) |
+| arav_renewal_0 | 0.471 | +17.1% | 0.277 | +5.0% | 0.599 | +10.2% | 51% | 451 (440) |
+| kest_cancel_2 | 0.360 | +6.2% | 0.243 | +0.0% | 0.525 | +5.4% | 39% | 377 (411) |
+| kest_kyc_1 | 0.471 | +33.4% | 0.272 | +27.0% | 0.596 | +0.3% | 0% | 432 (339) |
+| kest_renewal_0 | 0.461 | +15.5% | 0.274 | +3.8% | 0.594 | +9.5% | 47% | 427 (433) |
+| nort_cancel_2 | 0.359 | +6.1% | 0.242 | -0.1% | 0.528 | +5.9% | 41% | 415 (393) |
+| nort_kyc_1 | 0.473 | +33.6% | 0.274 | +28.5% | 0.596 | +0.0% | 0% | 424 (323) |
+| nort_renewal_0 | 0.455 | +12.4% | 0.271 | +2.8% | 0.592 | +8.0% | 40% | 422 (411) |
+| tide_cancel_2 | 0.358 | +5.6% | 0.244 | -0.2% | 0.523 | +4.7% | 36% | 364 (407) |
+| tide_kyc_1 | 0.439 | +24.3% | 0.256 | +19.4% | 0.594 | +0.4% | 0% | 431 (356) |
+| tide_renewal_0 | 0.466 | +16.3% | 0.275 | +4.0% | 0.600 | +10.6% | 53% | 468 (438) |
+| ALL | 0.426 | +16.7% | 0.260 | +8.2% | 0.574 | +5.6% | 28% | 5021 (4729) |
 
 ## Changes applied by the controller
 
-40 applied — neutral: 6, beneficial: 32, harmful: 2
+39 applied — neutral: 6, beneficial: 32, harmful: 1
 
 - nort_cancel_2 v2 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=-0.004 didΔ=+0.000 → **neutral**
 - arav_cancel_2 v2 (controller_approved) dims=['welcome_message', 'voice'] engageΔ=-0.004 didΔ=+0.000 → **neutral**
@@ -61,22 +61,21 @@
 - tide_cancel_2 v5 (controller_approved) dims=['cohorts', 'voice'] engageΔ=+0.033 didΔ=+0.000 → **beneficial**
 - tide_cancel_2 v6 (controller_approved) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
 - tide_cancel_2 v7 (controller_approved) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
-- arav_cancel_2 v5 (controller_approved) dims=['voice'] engageΔ=-0.068 didΔ=+0.000 → **harmful**
 
 ## Governance
 
 ```
 {
-  "approval_requests": 42,
+  "approval_requests": 41,
   "decisions": {
-    "approved": 36,
+    "approved": 35,
     "rejected": 6,
     "expired": 0
   },
   "rejection_reasons": {
     "approver declined (judgement call)": 6
   },
-  "applied_via_approval": 36,
+  "applied_via_approval": 35,
   "auto_applied": 4,
   "auto_apply_rejected": 0,
   "apply_conflicts": 0,
@@ -110,15 +109,15 @@
 {
   "nort_renewal_0:welcome_message=W3": {
     "3": 0.85,
-    "4": 0.85
+    "4": 0.849
   },
   "kest_renewal_0:welcome_message=W3": {
     "3": 0.848,
-    "4": 0.85
+    "4": 0.851
   },
   "arav_renewal_0:welcome_message=W3": {
     "3": 0.847,
-    "4": 0.85
+    "4": 0.849
   },
   "tide_renewal_0:welcome_message=W3": {
     "3": 0.853,
