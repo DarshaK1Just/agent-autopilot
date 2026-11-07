@@ -9,3 +9,10 @@ grade:
 	mkdir -p reports && python -m sim grade --run runs/mine_$(NAME) --baseline runs/base_$(NAME) --out reports/$(NAME).md
 test:
 	python -m pytest -q tests
+
+controller:
+	./run.sh http://127.0.0.1:8700
+audit:
+	python -m controller.cli --db controller_state.db supervisor
+crash-demo:
+	python scripts/crash_demo.py --kills 4

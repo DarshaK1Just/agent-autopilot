@@ -475,3 +475,47 @@ def test_all_candidates_failing_validation_escalates(store):
     store.set_clock(store.now_minute + 60, "x")
     inc.respond(ctx)
     assert store.one("SELECT state FROM incidents")["state"] in ("OPEN", "ESCALATED")
+
+
+# ----------------------------------------------------------------------------- startup safety / client
+def test_state_from_another_world_is_archived_not_reused(tmp_path):
+    import os
+    from controller.main import ensure_matching_db
+    path = str(tmp_path / "c.db")
+    s = Store(path)
+    s.put("world_key", "world-A")
+    s.put("cur_events", 41)
+    s.close()
+    assert ensure_matching_db(path, "world-A") is None and os.path.exists(path)  # same world: resume
+    moved = ensure_matching_db(path, "world-B")                                  # new world: start clean
+    assert moved and not os.path.exists(path) and os.path.exists(moved)
+
+
+def test_client_retries_reads_but_never_posts():
+    import httpx
+    from controller.client import SimClient, SimUnavailable
+    calls = {"get": 0, "post": 0}
+
+    def handler(req: httpx.Request):
+        if req.method == "GET":
+            calls["get"] += 1
+            return httpx.Response(503) if calls["get"] < 3 else httpx.Response(200, json={"ok": True})
+        calls["post"] += 1
+        return httpx.Response(500)
+    c = SimClient("http://sim", retries=4, backoff=0.0)
+    c.http = httpx.Client(base_url="http://sim", transport=httpx.MockTransport(handler))
+    assert c.state() == {"ok": True} and calls["get"] == 3
+    with pytest.raises(SimUnavailable):
+        c.advance(60)
+    assert calls["post"] == 1  # an ambiguous side-effecting call is reconciled by the caller, not resent
+
+
+def test_client_maps_conflicts_to_typed_errors():
+    import httpx
+    from controller.client import SimClient
+    c = SimClient("http://sim", backoff=0.0)
+    c.http = httpx.Client(base_url="http://sim", transport=httpx.MockTransport(
+        lambda r: httpx.Response(409, json={"error": "stale_base_version", "detail": {"current_version": 7}})))
+    with pytest.raises(SimError) as e:
+        c.apply("w1", "apr_1")
+    assert e.value.code == "stale_base_version" and e.value.detail == {"current_version": 7}

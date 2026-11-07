@@ -246,6 +246,35 @@ class Controller:
         return 0
 
 
+def world_key(client: SimClient) -> str:
+    """Identity of the simulated world: a restarted simulator (or another scenario) is a new world."""
+    st = client.state()
+    first = (client.chunks("history") or client.chunks("events") or [{}])[0]
+    wfs = sorted(w["workflow_id"] for w in client.workflows())
+    return json.dumps([st["scenario"], st["end_minute"], first.get("last_event_id"), first.get("until_ts"), wfs])
+
+
+def ensure_matching_db(path: str, key: str) -> str | None:
+    """If `path` belongs to a different world, move it aside so stale cursors can never be applied to a new world."""
+    import os
+    import sqlite3
+    if not os.path.exists(path):
+        return None
+    try:
+        db = sqlite3.connect(path)
+        row = db.execute("SELECT v FROM kv WHERE k='world_key'").fetchone()
+        db.close()
+    except sqlite3.DatabaseError:
+        row = None
+    if row is None or json.loads(row[0]) == key:
+        return None
+    dest = f"{path}.{int(time.time())}.old"
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(path + suffix):
+            os.replace(path + suffix, dest + suffix)
+    return dest
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
@@ -253,7 +282,14 @@ def main(argv=None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if a.verbose else logging.WARNING, format="%(asctime)s %(name)s %(message)s")
+    probe = SimClient(a.url)
+    key = world_key(probe)
+    probe.close()
+    moved = ensure_matching_db(a.db, key)
+    if moved:
+        log.warning("existing state belongs to a different simulator world; archived as %s", moved)
     c = Controller(a.url, a.db)
+    c.store.put("world_key", key)
     try:
         return c.run()
     except KeyboardInterrupt:
