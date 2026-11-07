@@ -21,7 +21,8 @@ def other_kpi(primary: str) -> str:
 def arm_counts(store: Store, wf: str, dim: str, *, min_ver: int = 0, min_blk: int | None = None,
                max_blk: int | None = None, cohs: list[str] | None = None, sl: str = "all", sv: str = ""):
     """{(ver, coh, opt): (dials, conn, eng)} for one lever and one population slice."""
-    sql = ["SELECT ver, coh, opt, SUM(dials) d, SUM(conn) c, SUM(eng) e FROM agg",
+    # INDEXED BY: without ANALYZE statistics SQLite prefers the (wf, blk, ...) primary key, whose cost grows with history.
+    sql = ["SELECT ver, coh, opt, SUM(dials) d, SUM(conn) c, SUM(eng) e FROM agg INDEXED BY agg_scan",
            "WHERE wf=? AND dim=? AND sl=? AND sv=? AND ver>=?"]
     args: list = [wf, dim, sl, sv, min_ver]
     if min_blk is not None:
