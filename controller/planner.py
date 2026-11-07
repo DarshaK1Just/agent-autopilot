@@ -440,6 +440,9 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         cur = cfgutil.eff(ctx.cfg, scope, dim)
         if w not in cur or ctl not in cur:
             continue
+        first = ctx.store.one("SELECT MIN(blk) b FROM agg WHERE wf=? AND dim=? AND coh=? AND ver>=?", (ctx.wf, dim, scope, s["start_ver"]))["b"]
+        if first is None or ctx.blk_now - first < pol.decay_window_blocks:
+            continue  # the decay test is defined over a full window of post-promotion data
         recent = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=s["start_ver"], min_blk=ctx.blk_now - pol.decay_window_blocks, cohs=[scope])
         whole = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=s["start_ver"], cohs=[scope])
         cr, cw = ev.stratified(recent, w, ctl, ctx.primary, ctx.prior), ev.stratified(whole, w, ctl, ctx.primary, ctx.prior)
