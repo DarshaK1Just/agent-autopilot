@@ -197,6 +197,11 @@ def _dropped(ctx: WfCtx, st: dict) -> set:
     return {o for o, m in st["dropped"].items() if m + ctx.pol.retire_minutes > ctx.minute}
 
 
+def _benched(ctx: WfCtx, st: dict) -> set:
+    """Options that must not be (re-)offered right now: harm-stopped or rolled back within the retirement period."""
+    return _dropped(ctx, st) | {o for o, m in st["retired"].items() if m + ctx.pol.retire_minutes > ctx.minute}
+
+
 def plan_lever(ctx: WfCtx, dim: str, held: bool) -> list[Intent]:
     """Explore -> provisional winner -> confirmation on fresh data -> promotion -> decay watch, for one lever."""
     opts = ctx.spec["options"][dim]
@@ -326,9 +331,12 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
             patch["allocations"]["default"] = {dim: target}
             kinds.append("harm_stop")
     else:
-        back = [o for o in opts if o not in cur and o not in dropped and o != ctl]
+        benched = _benched(ctx, st)
+        # Only arms stopped on early harm evidence that has since expired come back. A rolled-back winner has a measured record
+        # of decay and is not re-offered automatically.
+        back = [o for o in st["dropped"] if o in opts and o not in cur and o not in benched and o != ctl]
         if back:  # earlier harm evidence has expired: offer the arm again (a noisy opening is not a verdict)
-            patch["allocations"]["default"] = {dim: explore_dist([o for o in opts if o not in dropped], ctl, pol.explore_control_share)}
+            patch["allocations"]["default"] = {dim: explore_dist([o for o in opts if o not in benched], ctl, pol.explore_control_share)}
             kinds.append("reintroduce")
     c_int = _cohort_candidates(ctx, dim, st, ds, a0, set(harm) | dropped)
     if c_int:
@@ -358,7 +366,7 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
     if "cohort" in kinds:
         summary_bits.append(f"Provisionally tailor {dim} for cohorts {', '.join(cohorts_add)} (to be confirmed on fresh data)")
     if "reintroduce" in kinds:
-        summary_bits.append(f"Offer {dim} options {[o for o in opts if o not in cur and o not in dropped and o != ctl]} again (earlier harm evidence expired)")
+        summary_bits.append(f"Offer {dim} options {back} again (earlier harm evidence expired)")
     conf = rows[a0]["p_lift_gt_min"] if win else max([e[2]["p_win"] for e in c_int.values()] or [0.5])
     return [Intent(ctx.okey("+".join(kinds), dim, patch, ds["start_ver"]), "+".join(kinds), ctx.wf, (dim,) if patch else (),
                    patch, "; ".join(summary_bits),
@@ -419,12 +427,9 @@ def _withdraw_patch(ctx: WfCtx, dim: str, st: dict, scope: str, w: str, ctl: str
         live = [o for o in opts if o != w and o not in _dropped(ctx, st)]
         target = explore_dist(live, ctl, pol.explore_control_share) if len(live) >= 2 else {ctl: 1.0}
         return ({"allocations": {"default": {dim: target}}}, {"phase": "EXPLORING", "control": ctl, "start_ver": "$V"}, {})
-    patch = {"allocations": {scope: {dim: None}}}
-    others = [d for d in (ctx.cfg["allocations"].get(scope) or {}) if d != dim]
-    sched = (ctx.cfg["schedule"]["hour_weights"].get(scope) is not None)
-    if not others and not sched:
-        patch["cohorts_remove"] = [scope]   # a cohort with no remaining purpose is not kept (it would only fragment traffic)
-    return (patch, None, {"cohorts_remove": patch.get("cohorts_remove", [])})
+    # A cohort falls back to its own known control, not to the default allocation (which may be an exploration mix that
+    # contains arms this cohort has no reason to trust). The cohort and its single-option override stay: stable, if unambitious.
+    return ({"allocations": {scope: {dim: {ctl: 1.0}}}}, None, {})
 
 
 def _confirm(ctx: WfCtx, dim: str, st: dict, scope: str = "default") -> list[Intent]:
@@ -459,8 +464,6 @@ def _confirm(ctx: WfCtx, dim: str, st: dict, scope: str = "default") -> list[Int
     if severe or (enough and p_pos <= 1 - pol.confirm_prob):  # symmetric with confirmation (or a regression)
         patch, new_state, extra = _withdraw_patch(ctx, dim, st, scope, w, ctl)
         upd = {"dims": {dim: {"scopes": {scope: new_state}, **({"retired": {w: ctx.minute}} if scope == "default" else {})}}}
-        if extra.get("cohorts_remove"):
-            upd["cohorts_remove"] = extra["cohorts_remove"]
         why = "severe regression against its control" if severe else "fresh data does not support the first-look lift"
         return [Intent(ctx.okey("unconfirmed", dim, w, scope), "unconfirmed", ctx.wf, (dim,), patch,
                        f"Withdraw provisional {dim} {w} for {scope}: {why}",
@@ -540,7 +543,7 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
     pol = ctx.pol
     out_patch: dict = {"allocations": {}}
     upd: dict = {}
-    reasons, evd, removed, retired = [], {}, [], {}
+    reasons, evd, retired = [], {}, {}
     cohort_ids = {c["id"] for c in ctx.cfg["cohorts"]}
     for scope, s in st["scopes"].items():
         if s.get("phase") != "PROMOTED" or s["winner"] == s["control"] or (scope != "default" and scope not in cohort_ids):
@@ -577,20 +580,17 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         if why:
             patch, new_state, extra = _withdraw_patch(ctx, dim, st, scope, w, ctl)
             out_patch["allocations"].update(patch["allocations"])
-            removed += patch.get("cohorts_remove", [])
             upd[scope] = new_state
             if scope == "default":
                 retired[w] = ctx.minute
             reasons.append(f"{dim}={w} in {scope}: {why}")
     if not reasons:
         return []
-    if removed:
-        out_patch["cohorts_remove"] = removed
     return [Intent(ctx.okey("rollback", dim, sorted(upd)), "rollback", ctx.wf, (dim,), out_patch,
                    "Roll back: " + "; ".join(reasons),
                    "A promoted arm stopped beating its holdout (or regressed); reverting to the control and re-exploring.",
                    evd, protective=True, urgent=True, confidence=0.8, expected_rel_lift=0.02,
-                   exp_update={"dims": {dim: {"scopes": upd, "retired": retired}}, **({"cohorts_remove": removed} if removed else {})})]
+                   exp_update={"dims": {dim: {"scopes": upd, "retired": retired}}})]
 
 
 # --------------------------------------------------------------------------------------- caller id
