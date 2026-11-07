@@ -22,7 +22,6 @@ class Policy:
     max_cohorts: int = 6                   # D
     decay_window_blocks: int = 6           # D: 36h window (6h blocks)
     decay_p: float = 0.20                  # D: roll back when P(winner still clears the practical-lift bar vs its holdout) <= 20%
-    decay_min_trials: int = 100            # D
     retire_minutes: int = 3 * 1440         # D: a rolled-back option is not re-promoted for 3 days
     # --- caller id
     did_window_blocks: int = 6             # D: 36h

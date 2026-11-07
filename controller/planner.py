@@ -443,8 +443,8 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         recent = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=s["start_ver"], min_blk=ctx.blk_now - pol.decay_window_blocks, cohs=[scope])
         whole = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=s["start_ver"], cohs=[scope])
         cr, cw = ev.stratified(recent, w, ctl, ctx.primary, ctx.prior), ev.stratified(whole, w, ctl, ctx.primary, ctx.prior)
-        if cr is None or min(cr.n_arm, cr.n_ctl) < pol.decay_min_trials:
-            continue
+        if cr is None or min(cr.n_arm, cr.n_ctl) < pol.min_trials_arm:
+            continue  # a demotion needs at least the sample a promotion needs; otherwise promote/demote can flap on noise
         # A promoted arm must keep clearing the bar it was promoted on (practical lift over its own holdout). The lift
         # measured at promotion is not used: it is a maximum over noisy arms and biased upward.
         p_still = cr.p_greater(pol.min_relative_lift * cr.rate_ctl)

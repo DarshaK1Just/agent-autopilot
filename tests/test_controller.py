@@ -821,3 +821,9 @@ def test_server_error_on_submit_leaves_a_planned_row_and_resubmits_with_the_same
     gov.reconcile({"w1": SPEC}, {"w1": 1})
     assert store.one("SELECT state, pid FROM proposals")["pid"] == pid and len(sim.approvals) == 1
     assert store.one("SELECT state FROM proposals")["state"] == "PENDING"
+
+
+def test_fresh_promotion_is_not_demoted_on_a_couple_of_hours_of_data(store):
+    from controller.planner import plan_lever
+    ctx = _promoted(store, (60, 30), (20, 10))  # winner looks flat, but only 20 control calls per block x 4 = 80 < min_trials_arm
+    assert plan_lever(ctx, "welcome_message", held=False) == []
