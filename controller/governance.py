@@ -10,6 +10,7 @@ request landed and adopts it instead of resending, so restarts cannot duplicate 
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 from typing import Callable
@@ -162,7 +163,8 @@ class Governor:
                                  "evidence": body.get("evidence"), "dry_run": body["dry_run"], "impact_score": body["impact_score"],
                                  "affected_leads": body["affected_leads"], "rationale": body["rationale"],
                                  "intents": [{"key": i.key, "kind": i.kind, "evidence": i.evidence} for i in intents],
-                                 "policy": {"max_shift": cfgutil.max_shift(ctx.cfg, new), "auto": ctx.spec["governance"]["auto_apply"]}})
+                                 "governance_policy": {"max_shift_needed": cfgutil.max_shift(ctx.cfg, new), "auto": ctx.spec["governance"]["auto_apply"]},
+                                 "thresholds": dataclasses.asdict(self.pol)})
         return self._send(self._row(pid), ctx.spec)
 
     def _body(self, ctx: WfCtx, intents: list[Intent], new: dict, dims: list[str], pid: str) -> dict:

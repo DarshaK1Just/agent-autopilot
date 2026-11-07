@@ -60,6 +60,11 @@ def explain(db, wf: str, at: int):
     print("  TIMELINE (from controller audit):")
     for a in db.execute("SELECT * FROM audit WHERE proposal_id=? ORDER BY id", (pid,)):
         print(f"    {fmt(db, a['minute'])}  {a['kind']:<20} [{a['actor']}] {a['summary'][:150]}")
+    planned = db.execute("SELECT detail FROM audit WHERE proposal_id=? AND kind='proposal_planned'", (pid,)).fetchone()
+    if planned:
+        th = j(planned["detail"]).get("thresholds", {})
+        keep = ("tail_prob", "min_relative_lift", "harm_relative_drop", "min_trials_arm", "confirm_prob", "holdout_share", "provisional_share")
+        print("  THRESHOLDS:", ", ".join(f"{k}={th[k]}" for k in keep if k in th))
     ev = body.get("evidence") or {}
     for key, e in (ev.get("intents") or {}).items():
         print(f"  EVIDENCE {key}: {json.dumps(e, default=str)[:700]}")
