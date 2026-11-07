@@ -5,7 +5,6 @@ the run still finishes with no duplicate side effects. Writes reports/crash_reco
     .venv/bin/python scripts/crash_demo.py [--kills 4] [--seed 7]
 """
 import argparse
-import json
 import os
 import random
 import signal

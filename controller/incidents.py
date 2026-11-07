@@ -180,7 +180,7 @@ class Incidents:
         data["chosen"] = prompt
         self._save(inc, data, "PROPOSING")
         why = (f"{prompt} validated at pass_rate {rec['pass_rate']} (n={rec['n']}, policy floor {min_pass})"
-               + (f"; it ran in production before with a flag rate within baseline" if prompt in last_good else ""))
+               + ("; it ran in production before with a flag rate within baseline" if prompt in last_good else ""))
         return [Intent(f"{inc['id']}:fix:{prompt}", "prompt_fix", ctx.wf, ("prompt_version",), {"prompt_version": prompt},
                        f"Replace prompt {bad} with {prompt} (hallucination flag rate {evd['rate']:.1%} vs {evd['baseline_rate']:.1%} baseline)",
                        f"Incident {inc['id']}: {evd['flagged']}/{evd['connected']} connected calls flagged on {bad}. {why}. "

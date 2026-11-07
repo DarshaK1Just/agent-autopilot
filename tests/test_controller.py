@@ -70,7 +70,7 @@ def test_null_false_winner_rate_is_controlled(store):
     rng = np.random.default_rng(11)
     ctx = WfCtx(store, SPEC, CFG, 1, 100, 10000, POL)
     store.run("INSERT INTO agg VALUES('w1',-5,1,'default','voice','V1','all','',6000,2000,1000)")
-    false_wins, trials = 0, 300
+    false_wins, trials = 0, 1000
     for _ in range(trials):
         k0 = k1 = 0
         n = 0
@@ -85,7 +85,7 @@ def test_null_false_winner_rate_is_controlled(store):
                 won = True
                 break
         false_wins += won
-    assert false_wins / trials < 0.08  # measured 3.5-5% over 8 looks at alpha 0.05 (reports/false_winner_rate.md)
+    assert false_wins / trials < 0.07  # measured 3.5-5% over 8 looks at alpha 0.05 (reports/false_winner_rate.md)
 
 
 # ----------------------------------------------------------------------------- config helpers
