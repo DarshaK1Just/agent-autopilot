@@ -7,7 +7,7 @@ import pytest
 
 from controller import cfgutil, stats
 from controller.client import SimError, SimUnavailable
-from controller.governance import Governor, next_working
+from controller.governance import Governor, InvalidTransition, TRANSITIONS, next_working
 from controller.incidents import Incidents
 from controller.ingest import Ingestor
 from controller.planner import Intent, WfCtx, _decide
@@ -85,17 +85,7 @@ def test_null_false_winner_rate_is_controlled(store):
                 won = True
                 break
         false_wins += won
-    assert false_wins / trials < 0.09  # measured ~6-7% at family_alpha=0.07 with 8 sequential looks
-
-
-def test_heterogeneity_gate():
-    assert stats.heterogeneity_p([(0.12, 0.03), (-0.08, 0.03), (0.0, 0.03)]) < 0.001
-    assert stats.heterogeneity_p([(0.02, 0.05), (-0.01, 0.05), (0.0, 0.05)]) > 0.5
-
-
-def test_eb_shrinks_noisy_extremes():
-    post, mu, tau = stats.eb_shrink([(0.3, 0.2), (0.0, 0.02), (0.01, 0.02), (-0.01, 0.02)])
-    assert post[0][0] < 0.15
+    assert false_wins / trials < 0.08  # measured 3.5-5% over 8 looks at alpha 0.05 (reports/false_winner_rate.md)
 
 
 # ----------------------------------------------------------------------------- config helpers
@@ -331,8 +321,8 @@ def test_stale_base_is_terminal_and_replannable(store):
     gov = _gov(store, sim)
     gov.propose(_ctx(store), [_intent()])
     sim.approvals[0]["status"] = "approved"
-    sim.stale = True
-    gov.reconcile({"w1": SPEC}, {"w1": 2})
+    sim.stale = True  # supervisor edit lands between approval and apply
+    gov.reconcile({"w1": SPEC}, {"w1": 1})
     assert store.one("SELECT state FROM proposals")["state"] == "STALE"
     assert not gov.in_flight("w1")
 
@@ -519,3 +509,85 @@ def test_client_maps_conflicts_to_typed_errors():
     with pytest.raises(SimError) as e:
         c.apply("w1", "apr_1")
     assert e.value.code == "stale_base_version" and e.value.detail == {"current_version": 7}
+
+
+# ----------------------------------------------------------------------------- invariants added in the review
+def test_state_machine_rejects_illegal_moves(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    gov = _gov(store, FakeSim())
+    gov.propose(_ctx(store), [_intent()])
+    pid = store.one("SELECT pid FROM proposals")["pid"]
+    assert store.one("SELECT state FROM proposals")["state"] == "PENDING"
+    with pytest.raises(InvalidTransition):
+        gov._move(pid, "PLANNED")  # no way back
+    gov._move(pid, "REJECTED")
+    for target in ("APPLIED", "APPROVED", "PENDING"):
+        with pytest.raises(InvalidTransition):
+            gov._move(pid, target)  # terminal states have no way out
+    assert all(t for t in TRANSITIONS.values())
+
+
+def test_db_refuses_unknown_proposal_state(store):
+    import sqlite3
+    with pytest.raises(sqlite3.IntegrityError):
+        store.run("INSERT INTO proposals(pid,wf,route,state,base_version) VALUES('x','w1','auto','BOGUS',1)")
+
+
+@pytest.mark.parametrize("status", ["rejected", "expired"])
+def test_rejected_or_expired_proposal_is_never_applied(store, status):
+    store.set_clock(1440 + 11 * 60, "x")
+    sim = FakeSim()
+    applied = []
+    sim.apply = lambda wid, aid: applied.append(aid)
+    gov = _gov(store, sim)
+    gov.propose(_ctx(store), [_intent()])
+    sim.approvals[0]["status"] = status
+    for _ in range(3):
+        gov.reconcile({"w1": SPEC}, {"w1": 1})
+    assert applied == [] and store.one("SELECT state FROM proposals")["state"] == status.upper()
+
+
+def test_supervisor_edit_while_pending_abandons_and_unblocks_planning(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    sim = FakeSim()
+    gov = _gov(store, sim)
+    gov.propose(_ctx(store), [_intent()])
+    gov.reconcile({"w1": SPEC}, {"w1": 2})  # supervisor moved the config to v2
+    assert store.one("SELECT state FROM proposals")["state"] == "ABANDONED"
+    assert not gov.in_flight("w1")
+
+
+def test_urgent_fix_is_not_blocked_by_routine_proposal_in_flight(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    sim = FakeSim()
+    gov = _gov(store, sim)
+    gov.propose(_ctx(store), [_intent()])
+    fix = Intent("fix", "prompt_fix", "w1", ("prompt_version",), {"prompt_version": "P3"}, "fix", "why", {}, urgent=True,
+                 protective=True, validation_run_id="val_1")
+    assert gov.propose(_ctx(store), [fix]) is not None
+    assert store.one("SELECT COUNT(*) n FROM proposals WHERE state='PENDING'")["n"] == 2
+    # a second routine proposal is still refused while anything is in flight
+    assert gov.propose(_ctx(store), [_intent()]) is None
+
+
+def test_restart_resumes_approved_proposal_and_applies_once(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    sim = FakeSim()
+    _gov(store, sim).propose(_ctx(store), [_intent()])
+    sim.approvals[0]["status"] = "approved"
+    fresh = _gov(store, sim)  # a new process sees only the database
+    fresh.reconcile({"w1": SPEC}, {"w1": 1})
+    fresh.reconcile({"w1": SPEC}, {"w1": 2})
+    assert store.one("SELECT state FROM proposals")["state"] == "APPLIED" and len(sim.versions) == 2
+
+
+def test_cohort_needs_bonferroni_bar_and_never_uses_a_harmful_option(store):
+    from controller.planner import _cohort_candidates
+    cfg = copy.deepcopy(CFG)
+    ds = {"control": "W1", "start_ver": 1}
+    # slice 'hi' shows W3 +11pts over W1 (n=250/arm) but W3 was already stopped as harmful workflow-wide
+    for opt, (conn, eng) in {"W1": (250, 100), "W3": (250, 128)}.items():
+        store.run("INSERT INTO agg VALUES('w1',1,1,'default','welcome_message',?,'lang','hi',?,?,?)", (opt, conn * 3, conn, eng))
+        store.run("INSERT INTO agg VALUES('w1',1,1,'default','welcome_message',?,'all','',?,?,?)", (opt, conn * 3, conn, eng))
+    ctx = WfCtx(store, SPEC, cfg, 1, 100, 10000, POL)
+    assert _cohort_candidates(ctx, "welcome_message", {}, ds, "W1", {"W3"}) == {}

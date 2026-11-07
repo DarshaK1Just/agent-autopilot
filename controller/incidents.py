@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 
-from . import evidence as ev, stats
+from . import stats
 from .client import SimClient, SimError, SimUnavailable
 from .planner import Intent, WfCtx
 from .policy import Policy
@@ -23,8 +23,8 @@ class Incidents:
         self.credits = None
 
     # ------------------------------------------------------------------ credits
-    def spend_ok(self, cost: float, reserve_ok: bool = True) -> bool:
-        return self.credits is not None and self.credits - cost >= (0 if reserve_ok else self.pol.credit_reserve)
+    def spend_ok(self, cost: float) -> bool:
+        return self.credits is not None and self.credits >= cost
 
     def _ledger(self, wf, kind, amount, purpose, balance):
         self.credits = balance
@@ -151,7 +151,7 @@ class Incidents:
                     cands[p] = rec
                     self._save(inc, data)
         choice = self._pick(ctx, cands, min_pass, last_good, data, evd, n, inc)
-        if choice is None and data["llm_rounds"] < 2 and self.spend_ok(3):
+        if choice is None and data["llm_rounds"] < self.pol.inc_max_llm_rounds and self.spend_ok(3):
             try:
                 r = self.c.suggest_fixes(ctx.wf, f"hallucination flag rate {evd['rate']:.1%} vs baseline {evd['baseline_rate']:.1%} "
                                                  f"on prompt {bad} over {evd['connected']} connected calls")
@@ -162,7 +162,7 @@ class Incidents:
                 data["llm_rounds"] += 1
                 for sug in r["suggestions"]:
                     p = sug["prompt_version"]
-                    if p in allowed and p not in cands and len([x for x in cands if x not in last_good]) < 3:
+                    if p in allowed and p not in cands and len([x for x in cands if x not in last_good]) < self.pol.inc_max_new_candidates:
                         rec = self._validate(ctx, inc, data, p, n)
                         if rec:
                             cands[p] = rec
@@ -171,7 +171,7 @@ class Incidents:
             except (SimError, SimUnavailable) as e:
                 self.s.audit("llm_error", str(e), wf=ctx.wf, ref=inc["id"])
         if choice is None:
-            if data["llm_rounds"] >= 2 or not self.spend_ok(3):
+            if data["llm_rounds"] >= self.pol.inc_max_llm_rounds or not self.spend_ok(3):
                 self.s.audit("incident_escalated", "no candidate passed validation within credit/round limits; needs a human",
                              wf=ctx.wf, ref=inc["id"], detail={"candidates": cands})
                 self._save(inc, data, "ESCALATED")

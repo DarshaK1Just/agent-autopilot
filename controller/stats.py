@@ -65,36 +65,6 @@ def pool(cs: list[Contrast]) -> Contrast | None:
     return Contrast(d, math.sqrt(1.0 / W), n_arm, n_ctl, ra, rc)
 
 
-def eb_shrink(ests: list[tuple[float, float]], floor_tau: float = 0.0) -> tuple[list[tuple[float, float]], float, float]:
-    """Empirical-Bayes partial pooling of per-slice effects towards their precision-weighted mean
-    (DerSimonian-Laird tau^2). Returns [(post_mean, post_sd)], grand mean and tau. Shrinkage is the
-    multiplicity control for slice-level hypotheses: noisy small slices cannot look extreme."""
-    if not ests:
-        return [], 0.0, 0.0
-    w = [1.0 / max(sd * sd, 1e-12) for _, sd in ests]
-    W = sum(w)
-    mu = sum(wi * d for wi, (d, _) in zip(w, ests)) / W
-    q = sum(wi * (d - mu) ** 2 for wi, (d, _) in zip(w, ests))
-    k = len(ests)
-    c = W - sum(wi * wi for wi in w) / W
-    tau2 = max(0.0, (q - (k - 1)) / c) if k > 1 and c > 0 else 0.0
-    tau2 = max(tau2, floor_tau ** 2)
-    out = []
-    for d, sd in ests:
-        v = sd * sd
-        if tau2 <= 0:
-            out.append((mu, math.sqrt(1.0 / W)))
-            continue
-        pm = (d / v + mu / tau2) / (1 / v + 1 / tau2)
-        pv = 1.0 / (1 / v + 1 / tau2)
-        out.append((pm, math.sqrt(pv)))
-    return out, mu, math.sqrt(tau2)
-
-
-def sidak(alpha: float, m: int) -> float:
-    return 1.0 - (1.0 - alpha) ** (1.0 / max(m, 1))
-
-
 def binom_sf(k: int, n: int, p: float) -> float:
     """P(X >= k) for X~Bin(n,p). Exact for small mean, continuity-corrected normal otherwise."""
     if k <= 0:
@@ -129,48 +99,3 @@ def two_prop_z(k1: int, n1: int, k0: int, n0: int) -> float:
     p = (k1 + k0) / (n1 + n0)
     se = math.sqrt(max(p * (1 - p) * (1 / n1 + 1 / n0), 1e-12))
     return (k1 / n1 - k0 / n0) / se
-
-
-def chi2_sf(x: float, df: int) -> float:
-    """P(Chi2_df >= x) via the regularised upper incomplete gamma function."""
-    if x <= 0 or df <= 0:
-        return 1.0
-    a, x = df / 2.0, x / 2.0
-    if x < a + 1:
-        term = total = 1.0 / a
-        n = a
-        for _ in range(500):
-            n += 1
-            term *= x / n
-            total += term
-            if abs(term) < abs(total) * 1e-12:
-                break
-        return max(0.0, 1.0 - total * math.exp(-x + a * math.log(x) - math.lgamma(a)))
-    tiny = 1e-300
-    b = x + 1 - a
-    c = 1 / tiny
-    d = 1 / b
-    h = d
-    for i in range(1, 500):
-        an = -i * (i - a)
-        b += 2
-        d = an * d + b
-        d = tiny if abs(d) < tiny else d
-        c = b + an / c
-        c = tiny if abs(c) < tiny else c
-        d = 1 / d
-        delta = d * c
-        h *= delta
-        if abs(delta - 1) < 1e-12:
-            break
-    return min(1.0, math.exp(-x + a * math.log(x) - math.lgamma(a)) * h)
-
-
-def heterogeneity_p(ests: list[tuple[float, float]]) -> float:
-    """Cochran's Q test that per-slice effects are all equal (df = k-1)."""
-    if len(ests) < 2:
-        return 1.0
-    w = [1.0 / max(sd * sd, 1e-12) for _, sd in ests]
-    mu = sum(wi * d for wi, (d, _) in zip(w, ests)) / sum(w)
-    q = sum(wi * (d - mu) ** 2 for wi, (d, _) in zip(w, ests))
-    return chi2_sf(q, len(ests) - 1)

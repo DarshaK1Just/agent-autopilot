@@ -8,12 +8,12 @@ import sys
 import time
 from collections import Counter
 
-from . import cfgutil, evidence as ev
+from . import evidence as ev
 from .client import SimClient, SimError, SimUnavailable
 from .governance import Governor
 from .incidents import Incidents
 from .ingest import Ingestor
-from .planner import LEVERS, WfCtx, apply_exp_update, plan_caller_id, plan_lever, plan_schedule
+from .planner import LEVERS, WfCtx, apply_exp_update, plan_caller_id, plan_lever
 from .policy import Policy
 from .store import Store
 
@@ -149,14 +149,12 @@ class Controller:
         ctx = self.ctx(wf)
         self.inc.check(ctx)
         self.inc.verify(ctx)
-        if self.gov.in_flight(wf):
-            return
         urgent = self.inc.respond(ctx)
         if urgent:
             if self.gov.propose(ctx, urgent) is None:
                 self.inc.reopen(wf)
             return
-        if not routine or self.inc.active(wf):
+        if not routine or self.inc.active(wf) or self.gov.in_flight(wf):
             return
         held = self.held(wf)
         intents = []
@@ -165,8 +163,6 @@ class Controller:
         if "caller_id" not in held:
             last = self.store.one("SELECT MAX(created_minute) m FROM proposals WHERE wf=? AND dims LIKE '%caller_id%' AND state!='STALE'", (wf,))
             intents += plan_caller_id(ctx, (last["m"] or -10**9))
-        if "schedule" not in held and "cohorts" not in held:
-            intents += plan_schedule(ctx)
         for i in [i for i in intents if not i.patch and i.exp_update]:
             apply_exp_update(self.store, wf, i.exp_update, ctx.version)  # state-only: no config change, no proposal
             self.store.audit("experiment_reset", i.summary, wf=wf, detail=i.evidence)

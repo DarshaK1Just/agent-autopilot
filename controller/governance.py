@@ -2,7 +2,7 @@
 
 PLANNED -> PENDING -> APPROVED -> APPLIED     (approval route)
 PLANNED -> APPLIED                            (policy-permitted auto-apply route)
-PENDING -> REJECTED | EXPIRED ;  APPROVED -> LAPSED ;  any -> STALE (base version moved)
+PENDING -> REJECTED | EXPIRED | ABANDONED (base moved while waiting) ;  APPROVED -> LAPSED | STALE (base moved)
 
 A row is written PLANNED *before* any request leaves the process, with a deterministic id derived from
 (workflow, base version, proposed config). After a crash, `reconcile` finds out from the simulator whether the
@@ -21,7 +21,16 @@ from .policy import Policy
 from .store import Store
 
 OPEN_STATES = ("PLANNED", "PENDING", "APPROVED")
-TERMINAL = ("APPLIED", "REJECTED", "EXPIRED", "LAPSED", "STALE", "REFUSED", "FAILED")
+# The whole state machine. Anything not listed is terminal. Every change of `proposals.state` goes through Governor._move.
+TRANSITIONS = {
+    "PLANNED": {"PENDING", "APPLIED", "STALE", "REFUSED", "FAILED"},
+    "PENDING": {"APPROVED", "REJECTED", "EXPIRED", "LAPSED", "APPLIED", "ABANDONED", "FAILED"},
+    "APPROVED": {"APPLIED", "LAPSED", "STALE", "FAILED"},
+}
+
+
+class InvalidTransition(Exception):
+    pass
 
 
 def next_working(minute: int, hours: list[int]) -> int:
@@ -42,6 +51,13 @@ class Governor:
         self.affected_fn = affected_fn
         self.on_applied = on_applied
         self.on_failed = on_failed
+
+    def _move(self, pid: str, new: str, **cols):
+        cur = self.s.one("SELECT state FROM proposals WHERE pid=?", (pid,))["state"]
+        if new not in TRANSITIONS.get(cur, ()):
+            raise InvalidTransition(f"{pid}: {cur} -> {new}")
+        sets = ", ".join(f"{k}=?" for k in ("state", *cols))
+        self.s.run(f"UPDATE proposals SET {sets} WHERE pid=?", (new, *cols.values(), pid))
 
     # ------------------------------------------------------------------ queries
     def in_flight(self, wf: str):
@@ -92,12 +108,16 @@ class Governor:
 
     # ------------------------------------------------------------------ submission
     def propose(self, ctx: WfCtx, intents: list[Intent], eligible_fn=None) -> dict | None:
-        if not intents or self.in_flight(ctx.wf):
+        if not intents:
+            return None
+        urgent = any(i.urgent for i in intents)
+        # Urgent work (incident fixes, rollbacks) is not blocked by routine proposals already waiting; if the routine one
+        # is applied first, the urgent one goes STALE and is re-planned from the new base.
+        if any(not (urgent and not p["urgent"]) for p in self.in_flight(ctx.wf)):
             return None
         new, dims = self.compose(ctx, intents)
         if not dims:
             return None
-        urgent = any(i.urgent for i in intents)
         route = self.choose_route(ctx, new, dims, intents)
         fp = cfgutil.fingerprint(new)
         prior = self.s.q("SELECT state, submitted_minute, created_minute FROM proposals WHERE wf=? AND base_version=? AND pid LIKE ?",
@@ -182,8 +202,7 @@ class Governor:
         exp = self.minute_of(appr["expires_at"])
         sub = self.s.now_minute
         with self.s.tx():
-            self.s.run("UPDATE proposals SET state='PENDING', approval_id=?, submitted_minute=?, expires_minute=? WHERE pid=?",
-                       (appr["approval_id"], sub, exp, p["pid"]))
+            self._move(p["pid"], "PENDING", approval_id=appr["approval_id"], submitted_minute=sub, expires_minute=exp)
             self.s.audit("proposal_submitted", f"approval {appr['approval_id']} requested; expires {appr['expires_at']}",
                          wf=p["wf"], proposal_id=p["pid"], detail={"approval": appr})
 
@@ -210,8 +229,7 @@ class Governor:
 
     def _terminal(self, p, state: str, why: str, detail: dict):
         with self.s.tx():
-            self.s.run("UPDATE proposals SET state=?, result=?, reasons=? WHERE pid=?",
-                       (state, json.dumps(detail, default=str), why, p["pid"]))
+            self._move(p["pid"], state, result=json.dumps(detail, default=str), reasons=why)
             self.s.audit(f"proposal_{state.lower()}", why, wf=p["wf"], proposal_id=p["pid"], detail=detail,
                          actor="simulator" if state in ("REJECTED", "EXPIRED", "LAPSED") else "controller")
         if self.on_failed:
@@ -219,8 +237,8 @@ class Governor:
 
     def _applied(self, p, version: int):
         with self.s.tx():
-            self.s.run("UPDATE proposals SET state='APPLIED', applied_version=?, decided_minute=COALESCE(decided_minute,?) WHERE pid=?",
-                       (version, self.s.now_minute, p["pid"]))
+            self._move(p["pid"], "APPLIED", applied_version=version,
+                       decided_minute=self._row(p["pid"])["decided_minute"] or self.s.now_minute)
             self.s.audit("proposal_applied", f"config v{version} live", wf=p["wf"], proposal_id=p["pid"],
                          detail={"version": version, "route": p["route"]})
             for it in json.loads(p["intent_keys"] or "[]"):
@@ -237,6 +255,10 @@ class Governor:
                 if p["state"] == "PLANNED":
                     self._reconcile_planned(p, current_versions[wf])
                 elif p["state"] == "PENDING":
+                    if p["base_version"] < current_versions[wf]:
+                        self._terminal(p, "ABANDONED", f"config moved v{p['base_version']} -> v{current_versions[wf]} while pending; "
+                                       "the approval can no longer be applied, planning resumes from the new base", {})
+                        continue
                     self._poll_pending(p)
                 elif p["state"] == "APPROVED":
                     self._apply_approved(self._row(p["pid"]))
@@ -268,8 +290,7 @@ class Governor:
         dm = self.minute_of(a["decided_at"]) if a.get("decided_at") else self.s.now_minute
         if st == "approved":
             with self.s.tx():
-                self.s.run("UPDATE proposals SET state='APPROVED', decided_minute=?, apply_by_minute=? WHERE pid=?",
-                           (dm, self.minute_of(a["apply_by"]), p["pid"]))
+                self._move(p["pid"], "APPROVED", decided_minute=dm, apply_by_minute=self.minute_of(a["apply_by"]))
                 self.s.audit("proposal_approved", f"approved by client approver at {a['decided_at']}; apply by {a['apply_by']}",
                              wf=p["wf"], proposal_id=p["pid"], actor="client_approver", detail=a)
             self._apply_approved(self._row(p["pid"]))

@@ -65,7 +65,9 @@ CREATE INDEX IF NOT EXISTS exp_wf ON experiments(wf, dim);
 CREATE TABLE IF NOT EXISTS holds (wf TEXT, dim TEXT, until_minute INT, reason TEXT, PRIMARY KEY (wf, dim));
 
 CREATE TABLE IF NOT EXISTS proposals (
-  pid TEXT PRIMARY KEY, wf TEXT NOT NULL, route TEXT NOT NULL, state TEXT NOT NULL, base_version INT NOT NULL,
+  pid TEXT PRIMARY KEY, wf TEXT NOT NULL, route TEXT NOT NULL CHECK (route IN ('approval','auto')),
+  state TEXT NOT NULL CHECK (state IN ('PLANNED','PENDING','APPROVED','APPLIED','REJECTED','EXPIRED','LAPSED','STALE','REFUSED','FAILED','ABANDONED')),
+  base_version INT NOT NULL,
   dims TEXT, intent_keys TEXT, proposed_config TEXT, body TEXT, approval_id TEXT,
   created_minute INT, submitted_minute INT, decided_minute INT, expires_minute INT, apply_by_minute INT,
   applied_version INT, result TEXT, reasons TEXT, urgent INT DEFAULT 0
@@ -73,7 +75,8 @@ CREATE TABLE IF NOT EXISTS proposals (
 CREATE INDEX IF NOT EXISTS prop_wf ON proposals(wf, state);
 
 CREATE TABLE IF NOT EXISTS incidents (
-  id TEXT PRIMARY KEY, wf TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+  id TEXT PRIMARY KEY, wf TEXT NOT NULL, kind TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('OPEN','PROPOSING','VERIFYING','RESOLVED','ESCALATED')),
   opened_minute INT, closed_minute INT, evidence TEXT, data TEXT
 );
 CREATE INDEX IF NOT EXISTS inc_wf ON incidents(wf, state);
