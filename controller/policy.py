@@ -11,7 +11,7 @@ class Policy:
     min_trials_slice: int = 200
     rel_min_lift: float = 0.03             # practical significance: >= 3% relative
     rel_harm: float = 0.02                 # arm is harmful if credibly worse than control by 2% relative
-    family_alpha: float = 0.10             # familywise error budget across challenger arms (Sidak)
+    family_alpha: float = 0.07             # familywise error budget across challenger arms (Sidak)
     slice_confidence: float = 0.975        # posterior probability for slice-level wins (after EB shrinkage)
     harm_confidence: float = 0.95
     futility_p: float = 0.10               # prune an arm when P(arm beats control) <= 10% with enough data
