@@ -669,7 +669,7 @@ def test_provisional_winner_is_confirmed_only_by_fresh_data(store):
 
 def test_provisional_winner_that_does_not_replicate_is_withdrawn(store):
     from controller.planner import plan_lever
-    ctx = _confirming(store, (800, 380), (400, 200))  # fresh: 0.475 vs 0.50 -> the first look was luck
+    ctx = _confirming(store, (1600, 720), (800, 400))  # fresh: 0.45 vs 0.50 -> the first look was luck
     (intent,) = plan_lever(ctx, "voice", held=False)
     assert intent.kind == "unconfirmed" and intent.urgent
     assert intent.exp_update["dims"]["voice"]["retired"] == {"V2": ctx.minute}
@@ -678,6 +678,12 @@ def test_provisional_winner_that_does_not_replicate_is_withdrawn(store):
 def test_unreplicated_winner_waits_when_fresh_data_is_thin(store):
     from controller.planner import plan_lever
     assert plan_lever(_confirming(store, (100, 60), (50, 25)), "voice", held=False) == []
+
+
+def test_withdrawal_needs_as_much_evidence_as_confirmation(store):
+    from controller.planner import plan_lever
+    # fresh lift -2pts on 355 control calls: P(better) ~0.25, neither confirmed nor withdrawn (the provisional split just continues)
+    assert plan_lever(_confirming(store, (765, 384), (355, 186)), "voice", held=False) == []
 
 
 # ----------------------------------------------------------------------------- dimension-aware concurrency
@@ -761,3 +767,57 @@ def test_one_noisy_caller_id_with_little_data_is_ignored(store):
     for intent in plan_caller_id(ctx, -10**9):
         assert intent.evidence["bad"] == []  # thin data is "unmeasured" (held at the probe share), never "degraded"
         assert min(intent.patch["allocations"]["default"]["caller_id"].values()) >= POL.did_probe_share - 1e-9
+
+
+# ----------------------------------------------------------------------------- failure injection
+def test_apply_timeout_keeps_proposal_approved_and_it_is_applied_exactly_once_later(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    sim = FakeSim()
+    real_apply, calls = sim.apply, {"n": 0}
+
+    def flaky(wid, aid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            real_apply(wid, aid)                      # the server applied it ...
+            raise SimUnavailable("timeout")           # ... but we never saw the response
+        return real_apply(wid, aid)
+    sim.apply = flaky
+    gov = _gov(store, sim)
+    gov.propose(_ctx(store), [_intent()])
+    sim.approvals[0]["status"] = "approved"
+    gov.reconcile({"w1": SPEC}, {"w1": 1})
+    assert store.one("SELECT state FROM proposals")["state"] == "APPROVED"  # unknown outcome: not marked applied, not abandoned
+    gov.reconcile({"w1": SPEC}, {"w1": 2})                                   # retry sees 409 not_approved -> reads history
+    assert store.one("SELECT state FROM proposals")["state"] == "APPLIED" and len(sim.versions) == 2  # one version, not two
+
+
+def test_apply_after_the_window_lapses_is_terminal(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    sim = FakeSim()
+    gov = _gov(store, sim)
+    gov.propose(_ctx(store), [_intent()])
+    sim.approvals[0]["status"] = "lapsed"
+    sim.approval = lambda aid: dict(sim.approvals[0], status="approved", decided_at="x", apply_by="x")
+    gov.reconcile({"w1": SPEC}, {"w1": 1})
+    assert store.one("SELECT state FROM proposals")["state"] == "LAPSED" and len(sim.versions) == 1
+
+
+def test_server_error_on_submit_leaves_a_planned_row_and_resubmits_with_the_same_id(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    sim = FakeSim()
+    real = sim.post_approval
+    state = {"fail": True}
+
+    def post(body):
+        if state["fail"]:
+            state["fail"] = False
+            raise SimUnavailable("500")
+        return real(body)
+    sim.post_approval = post
+    gov = _gov(store, sim)
+    gov.propose(_ctx(store), [_intent()])
+    pid = store.one("SELECT pid FROM proposals")["pid"]
+    assert store.one("SELECT state FROM proposals")["state"] == "PLANNED"
+    gov.reconcile({"w1": SPEC}, {"w1": 1})
+    assert store.one("SELECT state, pid FROM proposals")["pid"] == pid and len(sim.approvals) == 1
+    assert store.one("SELECT state FROM proposals")["state"] == "PENDING"

@@ -355,12 +355,12 @@ def _confirm(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
                        {**evd, "guardrail": g}, expected_rel_lift=c.diff / max(c.rate_ctl, 1e-6), confidence=p_pos,
                        dry_run=replay(counts, ["default"], ctx.primary, cfgutil.dist(ctx.cfg, "default", dim), target, ctl, ctx.prior),
                        exp_update={"dims": {dim: {"scopes": {"default": {"phase": "PROMOTED", "start_ver": "$V"}}}}})]
-    if p_bar <= pol.decay_p:
+    if p_pos <= 1 - pol.confirm_prob:  # symmetric with confirmation: withdraw only on equally strong evidence against
         live = [o for o in opts if o != w and o not in st["dropped"]]
         target = explore_dist(live, ctl, pol.explore_control_share) if len(live) >= 2 else {ctl: 1.0}
         return [Intent(ctx.okey("unconfirmed", dim, w), "unconfirmed", ctx.wf, (dim,), {"allocations": {"default": {dim: target}}},
                        f"Withdraw provisional {dim} {w}: fresh data does not support the first-look lift",
-                       f"Fresh lift {c.diff:+.3f}; P(clears the practical bar) {p_bar:.2f}. The first-look estimate was selection-biased; "
+                       f"Fresh lift {c.diff:+.3f}; P(better than control) {p_pos:.2f}. The first-look estimate was selection-biased; "
                        "back to exploring the remaining options.", evd, protective=True, urgent=True, confidence=0.8,
                        exp_update={"dims": {dim: {"scopes": {"default": {"phase": "EXPLORING", "control": ctl, "start_ver": "$V"}},
                                                   "retired": {w: ctx.minute}}}})]

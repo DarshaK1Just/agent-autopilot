@@ -104,22 +104,29 @@ def supervisor(db):
             print(f"   INCIDENT {i['id']} state={i['state']}")
 
 
+def pct(vals, q):
+    vals = sorted(vals)
+    return vals[min(int(len(vals) * q), len(vals) - 1)] if vals else None
+
+
 def health(db):
     q = lambda sql, *a: db.execute(sql, a).fetchall()
     now = int(json.loads(db.execute("SELECT v FROM kv WHERE k='now_minute'").fetchone()[0]))
     print(f"=== Controller health @ {fmt(db, now)} ===")
-    for name in ("ingest_events_per_sec", "decision_lag_seconds", "credits_remaining", "open_proposals", "open_incidents", "sim_http_errors"):
-        r = q("SELECT COUNT(*) n, AVG(value) a, MAX(value) m, (SELECT value FROM metrics WHERE name=? ORDER BY rowid DESC LIMIT 1) last FROM metrics WHERE name=?", name, name)[0]
-        print(f"  {name:<24} last={r['last']}  avg={r['a'] and round(r['a'], 3)}  max={r['m'] and round(r['m'], 3)}  samples={r['n']}")
+    print(f"  {'metric':<26}{'last':>10}{'mean':>10}{'p50':>9}{'p95':>9}{'p99':>9}{'max':>10}  n")
+    for name in ("t_ingest_seconds", "t_governance_seconds", "t_incident_seconds", "t_planning_seconds", "decision_lag_seconds", "step_seconds",
+                 "stage_fetch_seconds", "stage_decode_seconds", "stage_transform_seconds", "stage_aggregate_seconds", "stage_db_seconds",
+                 "ingest_events_per_sec", "ingest_backlog_chunks", "rss_mb", "db_mb", "credits_remaining", "open_proposals", "open_incidents",
+                 "sim_http_errors", "sim_http_retries"):
+        v = [r[0] for r in q("SELECT value FROM metrics WHERE name=? ORDER BY rowid", name)]
+        if v:
+            f = lambda x: f"{x:.3f}" if abs(x) < 100 else f"{x:.0f}"
+            print(f"  {name:<26}{f(v[-1]):>10}{f(sum(v) / len(v)):>10}{f(pct(v, .5)):>9}{f(pct(v, .95)):>9}{f(pct(v, .99)):>9}{f(max(v)):>10}  {len(v)}")
     print("  proposals by state:", {r["state"]: r["n"] for r in q("SELECT state, COUNT(*) n FROM proposals GROUP BY state")})
-    print("  decisions/day:", {r["d"]: r["n"] for r in q("SELECT minute/1440 d, COUNT(*) n FROM audit WHERE kind LIKE 'proposal_planned' GROUP BY d")})
     print("  credits spent:", q("SELECT COALESCE(SUM(amount),0) s FROM credits")[0]["s"])
-    print("  db pages:", q("PRAGMA page_count")[0][0] * q("PRAGMA page_size")[0][0] // 1024, "KiB")
-    print("  PAGE-WORTHY NOW:", end=" ")
-    alerts = [a["summary"] for a in q("SELECT summary FROM audit WHERE kind IN ('incident_escalated','credit_skip') ORDER BY id DESC LIMIT 3")]
-    stuck = q("SELECT pid FROM proposals WHERE state='PLANNED' AND ? - created_minute > 120", now)
-    alerts += [f"proposal {s['pid']} unsent >2h" for s in stuck]
-    print(alerts or "none")
+    alerts = [a["summary"] for a in q("SELECT summary FROM audit WHERE kind IN ('incident_escalated','credit_skip','credit_spend_unrecorded') ORDER BY id DESC LIMIT 3")]
+    alerts += [f"proposal {s['pid']} unsent >2h" for s in q("SELECT pid FROM proposals WHERE state='PLANNED' AND ? - created_minute > 120", now)]
+    print("  PAGE-WORTHY NOW:", alerts or "none")
 
 
 def log(db, wf: str | None, limit: int):
