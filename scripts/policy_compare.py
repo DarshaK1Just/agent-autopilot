@@ -47,7 +47,10 @@ def main():
                 act = [min(x for x in (r["rollback"], r["reopen"]) if x is not None) for r in prom if r["rollback"] is not None or r["reopen"] is not None]
                 times = [(b + 1 - ps.CHANGE_BLK) / 4 for b in act]; p_det = len(act) / max(len(prom), 1)
                 fp = "-"; fr = sum(1 for r in prom if r["early_rollbacks"] + r["early_reopens"] > 0) / max(len(prom), 1)
-            expo = 100 * sum(r["worse_calls"] for r in rs) / max(sum(r["total_calls"] for r in rs), 1)
+            # harmful exposure = calls on worse-than-control arms; in regimes 2 and 4 it is taken over runs that HAD a promoted winner
+            # (otherwise a policy that finds fewer winners looks safer than it is)
+            pool = prom if name[0] in "24" else rs
+            expo = 100 * sum(r["worse_calls"] for r in pool) / max(sum(r["total_calls"] for r in pool), 1)
             lab = "n/a" if name.startswith("5") else f"{100 * p_det:.0f}%"
             fr_s = "-" if name.startswith("5") else f"{100 * fr:.0f}%"
             print(f"| {name} | {vol} | {lab} | {med(times)} | {fp} | {fr_s} | {expo:.1f}% | {statistics.mean(r['proposals'] for r in rs):.1f} |")
