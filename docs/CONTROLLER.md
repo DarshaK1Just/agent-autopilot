@@ -45,7 +45,7 @@ python -m controller.cli --db controller_state.db log --wf ks_cancel --limit 60
 2. The remote live config is authoritative; proposals are `live config + intended diff`.
 3. Proposal state changes only through `Governor._move` against `TRANSITIONS` (and a DB `CHECK`); apply is attempted only from `APPROVED`.
 4. Every external intent has a deterministic id and a recovery path; the proposal row is written before the request.
-5. Experiment state advances only when its proposal is **applied**; no option (workflow or cohort) becomes a final winner without confirmation on fresh data; demotion mirrors confirmation; severe regressions use a separate fast path.
+5. Experiment state advances only when its proposal is **applied**; no option (workflow or cohort) becomes a final winner without confirmation on fresh data; a promoted arm has three outcomes (keep / reopen limited exploration / roll back); rollback mirrors confirmation; severe regressions use a separate fast path.
 6. One routine proposal in flight per workflow; an urgent one may go alongside only on disjoint dimensions (overlap supersedes the routine one); one urgent at a time.
 7. Customer-facing changes never auto-apply unless protective.
 8. Incidents and reconciliation run every iteration, including under backlog; routine planning pauses while evidence is incomplete.

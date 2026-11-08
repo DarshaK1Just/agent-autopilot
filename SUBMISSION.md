@@ -8,11 +8,11 @@
 ---
 
 ## 0. TL;DR
-A single-process controller. It keeps per-arm counters from the event stream in SQLite (one transaction per chunk, memory bounded by a batch), runs randomised welcome/voice tests with one deterministic Bayesian rule plus confirmation on fresh data (workflow winners and cohort overrides alike), reroutes degraded caller IDs, answers hallucination incidents (previous prompt first, LLM only if needed), and sends every change through an explicit proposal state machine with deterministic ids.
-public_01 +9.0% conclusion rate vs baseline (8 changes, 0 harmful); public_02 +23.0% (20 changes, 0 harmful, hallucinated calls 416→199, 5 credits); public_03 +16.2% in 2 min 47 s, 345 MB peak (48 changes, 0 harmful). Whole-policy simulation: 1% false promotion under the null, ~1.1 proposals per run.
+A single-process controller. It keeps per-arm counters from the event stream in SQLite (one transaction per chunk, memory bounded by a batch), runs randomised welcome/voice tests with one deterministic Bayesian rule plus confirmation on fresh data (workflow winners and cohort overrides alike), reopens limited exploration when a promoted arm stops being better, reroutes degraded caller IDs, answers hallucination incidents (previous prompt first, LLM only if needed), and sends every change through an explicit proposal state machine with deterministic ids.
+public_01 +9.0% conclusion rate vs baseline (8 changes, 0 harmful); public_02 +25.4% (17 changes, 0 harmful, hallucinated calls 416→209, 5 credits); public_03 +16.5% in 2 min 37 s, 346 MB peak (48 changes, 0 harmful). Whole-policy simulation: 1% false promotion under the null, ~1.1 proposals per run.
 Four SIGKILLs mid-run: no duplicate, no lost proposal, one continuous audit trail; identical audit trail across hash seeds. Decision path p99 0.10 s; ingest 94k events/s.
 Not built: call-time optimisation, cross-axis cohorts, UI, cross-tenant credit arbitration.
-Weakest points: little statistical power at dev scale (6–32% of the engagement headroom), and a winner that decays only to the control rate is deliberately not rolled back.
+Weakest points: little statistical power at dev scale (6–27% of the engagement headroom); a neutral winner is only recognised once there is enough data to say so, so on small workflows it can stay live for days.
 
 ## 1. Assumptions
 1. **Welcome message and voice act after pickup**, so they can move engagement but not pickup; only caller ID and *who is dialled when* can move pickup. Pickup-primary workflows therefore get caller-ID work, not welcome/voice tests (I did not build call-time work, §2). Guardrail checks still measure the other KPI for every candidate.
@@ -125,25 +125,29 @@ The remote config is authoritative: it is re-fetched every step and every propos
 * *harmful*: P(arm − control < −the harm bar).
 **Effect sizes are explicit.** Practical lift = max(3% **relative** to the control rate, 0.5 **points**); harm bar = max(2% relative, 0.33 points). The absolute floor matters near 0% and 100%: at a 1% rate "3% relative" would be 0.03 points of nothing. Near the edges the normal approximation is also unusable, so every arm needs ≥10 successes **and** ≥10 failures (`min_events`) as well as ≥250 trials. The denominator is always the KPI's own: engagement = engaged/connected, pickup = connected/dials.
 
-**Lifecycle of a lever (the same for the workflow and for each cohort override)**
+**Lifecycle of a lever (the same machinery for the workflow and for each cohort override)**
 ```
 EXPLORING --win--> CONFIRMING --fresh data: P(better) >= 0.90--> PROMOTED
      ^                 |                                             |
-     |                 | fresh data: P(better) <= 0.10,              | P(better than holdout) <= 0.10, harmful,
-     |                 | or severe regression                        | guardrail breached, or severe regression
-     +-----------------+---------------------------------------------+   (arm benched 3 days; a cohort falls back to ITS OWN control)
+     |  fresh P(better) <= 0.10, or severe regression                 |  still beneficial ............ stay
+     +-----------------+                                             |  no longer beneficial ........ REOPEN (incumbent keeps 70%)
+     +------------------------------------------------------------- |  worse / harmful / guardrail .. ROLL BACK to the control
 EXPLORING --P(harm) >= 0.99--> that arm is removed for the rest of the run
 ```
 * **Win** (first look): ≥250 trials and ≥10 events of each kind in both arms, P(clears the bar) ≥ 1 − 0.05/(challengers), guardrail KPI not credibly breached. Several winners are ranked by lower credible bound.
 * **Provisional split:** the winner gets half the traffic; the control and every challenger not yet ruled out keep the rest.
 * **Confirm** on data collected after the provisional split only: P(better) ≥ 0.90 and the guardrail holds → 85% winner / 15% control holdout.
-* **Demote** is the mirror of confirm: P(better than the holdout) ≤ 0.10, or credibly harmful, or the guardrail credibly breached. A winner that has merely decayed to the control rate is harmless and is kept (it costs no approver time).
+* **Three outcomes for a promoted arm, three different actions**, judged against its holdout:
+  * *still beneficial* (P(clears the practical bar) > 0.2): keep;
+  * *no longer beneficial* (P(clears the bar) ≤ 0.2 but P(better) > 0.10: not worse, just not worth its place): **reopen limited exploration**: the arm stays the incumbent/control at 70%, the other options (including the old control) share 30%, through the normal provisional → confirm lifecycle, so a better arm can be discovered and a false alarm costs only a mild 30% challenge;
+  * *worse or harmful* (P(better) ≤ 0.10, credibly harmful, or the guardrail credibly breached): roll back to the control.
+  A neutral winner used to freeze the lever, because only the winner and the control received traffic.
 * **Evidence-driven timing.** Demotion is judged on the smallest trailing window of at least one full day (the dialling-hour mix) that holds ≥250 trials in both arms: a busy workflow reacts after a day, a quiet one waits for evidence, not for a clock.
 * **Safety path.** A promoted arm more than 10% (relative) below its holdout, or collapsing the guardrail, with P ≥ 0.99 on ≥100 trials over the last two blocks, is rolled back immediately. Two paths only: optimisation (conservative, confirmed) and safety (fast, only for large effects).
 * **Harm stop:** an arm credibly worse than control (P ≥ 0.99, stronger than other decisions because the stop lasts the run) is removed. Re-offering a stopped arm would cost more than the rare false stop it repairs.
 * **Evidence labels** (supervisor view): `INSUFFICIENT` (not enough data: *unknown*), `UNDECIDED`, `NO_PRACTICAL_EFFECT` (every challenger measured and none credibly clears the bar), `DECIDED`. "No winner yet" is never reported as "no effect".
 
-**Why these are not flapping.** Entering needs ≥0.98 then 0.90 on independent data; leaving needs P(better) ≤ 0.10 on fresh data (provisional) or on a full day and ≥250 trials (promoted); a rolled-back arm is benched 3 days. A neutral arm needs two independent positive results to get in and an adverse result to get out.
+**Why these are not flapping.** Entering needs ≥0.98 then 0.90 on independent data; rolling back needs P(better) ≤ 0.10 on fresh data (provisional) or on a full day and ≥250 trials (promoted); a rolled-back arm is benched 3 days; a reopened exploration restarts the whole lifecycle with the incumbent as control. A neutral arm needs two independent positive results to get in and an adverse result to get out.
 
 **What the probability is.** The 0.05 is a *Bayesian posterior tail threshold*, split by Bonferroni across the challengers compared at one look. It is **not** a classical type-I-error guarantee: the same experiment is examined repeatedly. What I claim is what I measured.
 *Stage level* (`scripts/false_winner_sim.py`; stage 1 = up to 8 looks of 150 connected calls per arm, stage 2 = up to 6 fresh looks):
@@ -156,32 +160,46 @@ EXPLORING --P(harm) >= 0.99--> that arm is removed for the rest of the run
 | one challenger +10% relative | 75.6% | 60.9% |
 | one challenger +10% of 3 | 53.5% | 42.0% |
 
-*Whole policy* (`scripts/policy_sim.py`: the real planner run through 8 simulated days, planner every 12 h, approvals instantaneous, 300 runs per row; full table in `reports/policy_operating_characteristics.md`):
+*Whole policy* (`scripts/policy_sim.py`: the real planner run through 8 simulated days, planner every 12 h, approvals instantaneous, 300 runs per row; full tables in `reports/policy_operating_characteristics.md`). Static better arm:
 
-| true relative lift of the one better arm | connected calls/day | provisional win | confirmed final promotion | confirmed by day 1 | by day 3 | by day 8 | median days to confirm | confirmed arm later rolled back (false rollback) | proposals per run (mean) |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| +0% | 1000 | 4% | 1% | 0% | 0% | 1% | 4.2 | 50% | 1.1 |
-| +0% | 4000 | 2% | 1% | 0% | 0% | 1% | 3.8 | 50% | 1.1 |
-| +5% | 4000 | 35% | 29% | 0% | 9% | 29% | 4.0 | 11% | 1.7 |
-| +10% | 300 | 0% | 0% | 0% | 0% | 0% | - | 0% | 0.0 |
-| +10% | 1000 | 65% | 51% | 0% | 5% | 51% | 5.5 | 1% | 2.2 |
-| +10% | 4000 | 99% | 97% | 0% | 51% | 97% | 3.0 | 0% | 3.0 |
-| +20% | 1000 | 100% | 100% | 0% | 28% | 100% | 3.5 | 0% | 3.0 |
+| true relative lift of the better arm | calls/day | provisional win | **confirmed (false if +0%)** | confirmed by day 3 | by day 8 | median days to confirm | confirmed arm later rolled back | proposals / workflow |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| +0% | 1000 | 3% | 1% | 1% | 1% | 3.0 | 0% | 1.1 |
+| +0% | 4000 | 2% | 0% | 0% | 0% | 3.0 | 0% | 1.1 |
+| +10% | 300 | 0% | 0% | 0% | 0% | - | - | 0.0 |
+| +10% | 1000 | 68% | 54% | 3% | 54% | 5.0 | 1% | 2.3 |
+| +10% | 4000 | 100% | 99% | 57% | 99% | 3.0 | 0% | 3.2 |
+| +20% | 1000 | 100% | 100% | 26% | 100% | 3.5 | 0% | 3.0 |
 
-* Under the null the whole policy confirms a false winner about 1% of the time and spends ~1.1 proposals per run (the initial exploration request plus the occasional step): no approval spam.
-* A +10% lift is confirmed in 97% of runs at 4,000 connected calls/day (median 3 days) and 51% at 1,000/day; +20% at 1,000/day is found in 3.5 days; a +2% lift is below the practical bar and almost never acted on. At 300/day nothing is attempted: the planner declines to start a test that cannot reach a verdict.
-* A good (+10%) arm is falsely rolled back 0–1% of the time (demotion mirrors confirmation). The "false rollback" column is a share of the confirmed arms, so in the null rows it rests on a handful of runs.
+* Under the null the whole policy confirms a false winner in 0–1% of runs and spends ~1.1 proposals per workflow per run (essentially the initial exploration request): no approval spam.
+* A +10% lift is confirmed in 99% of runs at 4,000 connected calls/day (median 3 days) and 54% at 1,000/day; +20% at 1,000/day in 3.5 days; +2% is below the practical bar and almost never acted on; at 300/day the planner declines to start a test it cannot finish.
 
-| change | connected calls/day | promoted before the change | rolled back after the change | rolled back *before* the change (false) | median days from change to rollback |
-|---|---:|---:|---:|---:|---:|
-| regresses to −15% | 300 | 0% | 0% | 0% | - |
-| regresses to −15% | 1000 | 14% | 98% | 0% | 2.0 |
-| regresses to −15% | 4000 | 72% | 100% | 0% | 1.0 |
-| decays to 0% | 300 | 0% | 0% | 0% | - |
-| decays to 0% | 1000 | 14% | 31% | 0% | 2.5 |
-| decays to 0% | 4000 | 72% | 47% | 0% | 2.5 |
+The promoted arm's world changes on day 4 (arm +10% before):
 
-A promoted arm that collapses to −15% is rolled back in 98–100% of runs, at a median of 1–2 days (statistical time; approvals add hours). A winner that decays only to the control rate is kept in most runs: that is the intended trade (it is harmless), not a miss.
+| what changes | calls/day | promoted before | **acts** after the change | median days to act | action | **new better arm found** | median days to find | false rollback before the change | proposals / workflow |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| V2 collapses to −15% | 1000 | 19% | 100% | 1.5 | rollback 72% / reopen 28% | n/a | - | 0% | 2.1 |
+| V2 collapses to −15% | 4000 | 79% | 98% | 0.5 | rollback 64% / reopen 34% | n/a | - | 0% | 4.2 |
+| V2 decays to the control rate | 1000 | 17% | 63% | 2.0 | rollback 13% / reopen 50% | n/a | - | 0% | 1.9 |
+| V2 decays to the control rate | 4000 | 79% | 94% | 1.0 | rollback 20% / reopen 74% | n/a | - | 0% | 3.5 |
+| V2 → neutral, V4 becomes +10% | 1000 | 17% | 87% | 2.0 | rollback 13% / reopen 73% | 0% | - | 0% | 2.0 |
+| V2 → neutral, V4 becomes +10% | 4000 | 75% | 96% | 1.0 | rollback 14% / reopen 82% | 42% | 3.0 | 0% | 4.2 |
+| V2 → −10%, V4 becomes +12% | 1000 | 15% | 100% | 1.5 | rollback 48% / reopen 52% | 5% | 4.0 | 0% | 2.1 |
+| V2 → −10%, V4 becomes +12% | 4000 | 75% | 99% | 0.5 | rollback 47% / reopen 51% | 95% | 2.0 | 0% | 5.2 |
+
+* **Collapse to −15%:** acted on in 98–100% of runs, at a median of 0.5 days (4,000/day) to 1.5 days (1,000/day). About a third of those first show up as "no longer clearly better" while the window still mixes old and new data, so the first action can be the reopen (arm to 70%) with the rollback or replacement following; the arm is never left at 85%.
+* **Decay to the control rate:** previously a flat winner was rolled back in only 31–47% of runs and never reopened exploration; now exploration is reopened in 74% of runs at 4,000/day (median 1 day) and 50% at 1,000/day.
+* **A different arm becomes better:** found in 42% (neutral winner) to 95% (old winner turned bad) of runs at 4,000/day, median 2–3 days, within the 4 days left after the change; at 1,000/day it is rarely found inside the horizon (0–5%): the evidence does not accumulate fast enough. False rollback of a good arm before the change: 0%.
+
+A harmful arm in the mix:
+
+| calls/day | calls served by the harmful arm | harm-stopped by day 8 | median days to stop | confirmed V2 by day 8 |
+|---:|---:|---:|---:|---:|
+| 300 | 0.0% | 0% | - | 0% |
+| 1000 | 11.4% | 36% | 3.5 | 51% |
+| 4000 | 4.4% | 44% | 2.0 | 100% |
+
+At 1,000 calls/day a harmful arm serves ~11% of calls before the test ends or the arm is stopped (it has to be measured to be stopped); at 4,000/day ~4%.
 
 **Minimum sample.** `min_trials_arm = 250` is a heuristic floor against very early posterior noise and approval churn, plus `min_events = 10` for approximation validity. It is not a power calculation.
 
@@ -198,9 +216,9 @@ A promoted arm that collapses to −15% is rolled back in 98–100% of runs, at 
 | Bonferroni over challengers | picking the luckiest of several arms at one look |
 | stratification by version × cohort | bias when allocation changes mid-test (Simpson) |
 | provisional split + confirmation (workflow and cohort) | winner's curse and premature collapse of exploration |
-| symmetric demotion, full-day evidence-driven window | flapping; slow quiet workflows being judged on noise |
+| symmetric rollback, three-way outcome, full-day evidence-driven window | flapping; slow quiet workflows being judged on noise; a neutral winner freezing the lever |
 | safety path | a severe regression waiting for the optimisation-grade evidence bar |
-| guardrail check at decision, confirmation and during monitoring | winning on the primary KPI while hurting the other |
+| guardrail check at decision (workflow *and* cohort first look), confirmation and during monitoring | winning on the primary KPI while hurting the other |
 | harm stop at 99% | continuing to serve a credibly worse arm |
 
 **Policy values.** A = contract, B = business policy, C = derived, D = heuristic. All are in `controller/policy.py` beside their class.
@@ -210,7 +228,7 @@ A promoted arm that collapses to −15% is rolled back in 98–100% of runs, at 
 | 3% relative / 0.5-point lift floor; 2% relative / 0.33-point harm | B | smaller effects are not worth an approval or a rollback |
 | 250 trials per arm (200 per slice), 10 events | D / C | heuristic floor; approximation validity |
 | 50% provisional, 85/15 promoted | B/D | easy to reason about; kept fixed on purpose: an adaptive holdout adds a parameter that cannot be validated at this volume |
-| 40% incumbent share in tests (70% when a supervisor chose it) | D | control must keep enough data; a human's choice is a prior in its favour |
+| 40% incumbent share in a fresh test; 70% when the incumbent has a record (a supervisor's choice, or a promoted winner that stopped improving) | D | the control must keep enough data; a record is a prior in the incumbent's favour |
 | ≥1 day demotion window, 10% relative severe drop on ≥100 trials | D | diurnal cycle; large effects need less data |
 | cohorts ≥8% share, ≥0.4pt, ≤6 | D | a cohort must pay for itself |
 | 48h supervisor hold; routine ≥11:00, ≤2/day; 1 request slot per 24h kept for incidents | B | memo / policy |
@@ -258,15 +276,15 @@ The table is `TRANSITIONS` in `governance.py`; every state change goes through o
 * **public_02, ks_cancel (final run, from the audit store):**
 | sim time | event |
 |---|---|
-| D2 10:00 | (simulator) a caller ID is flagged; rerouted within the day: its share of dials 33.4% on D2 → 3.0% on D3 |
-| D3 11:30 | supervisor ships prompt P2 (observed as config v6 at 11:45) |
-| D3 15:45 | incident opened: 27/404 = 6.7% flagged vs 1.5% baseline; previous prompt P1 validated 0.986 on n=500 (5 credits, no LLM); proposal sent in the same step |
-| D3 17:15 | the approver **rejected** it (a random "judgement call", 5% base rate); the controller re-submitted in the same step |
-| D3 18:45 | approved and applied. **MTTR 435 min**; when the first attempt is approved the same incident is fixed in ~240 min |
-* **Where the time goes.** ~255 min detection (the statistical sample plus the 45-minute second look), <1 min validation, then approver latency per attempt (20–120 min, policy). Detection and the retry rule are controller-controlled; approver latency and rejections are not, and no public policy lets a prompt be auto-applied.
+| D2 10:00 | (simulator) a caller ID is flagged; rerouted within the day: its share of dials 33.4% on D2 → 3.3% on D3 |
+| D3 11:30 | supervisor ships prompt P2 (observed as config v5 at 11:45) |
+| D3 14:45 | incident opened: 20/298 = 6.7% flagged vs 1.5% baseline; previous prompt P1 validated 0.986 on n=500 (5 credits, no LLM); proposal sent in the same step |
+| D3 16:00 | approved and applied. **MTTR 270 min** |
+| D3 19:00 | verified: 4/272 = 1.5% flagged, incident closed |
+* **Where the time goes.** ~195 min detection (the statistical sample plus the 45-minute second look), <1 min validation, ~75 min approver latency (20–120 min, policy). If the approver randomly rejects the first request (5% base rate) the fix is re-submitted in the same step: 435 min in an earlier run of the same incident, versus 1,365 min before urgent requests used best-case latency. Detection and the retry rule are controller-controlled; approver latency and rejections are not, and no public policy lets a prompt be auto-applied.
 
 ## 8. Scale
-Measured on public_03_load (`reports/load_test.md`, `reports/performance.md`): the whole run — 7 history days + 5 live days, 12 workflows, 9.74 M events, simulator on the same box — took **2 min 47 s** (≈ 33 s per live simulated day against the 10-minute budget). Ingest 94k events/s (mean over ingest time, max 178k). Decision path per step: mean 0.04 s, p95 0.07 s, p99 0.10 s, max 0.14 s; ingestion is bursty (max 14.4 s for a step that reads four chunks). Peak RSS **345 MB**, DB 100 MB, 0 HTTP errors, backlog high-water 19 chunks (history bootstrap), drained in 5 iterations.
+Measured on public_03_load (`reports/load_test.md`, `reports/performance.md`): the whole run — 7 history days + 5 live days, 12 workflows, 9.74 M events, simulator on the same box — took **2 min 37 s** (≈ 31 s per live simulated day against the 10-minute budget). Ingest 90k events/s (mean over ingest time, max 174k). Decision path per step: mean 0.04 s, p95 0.07 s, p99 0.105 s, max 0.144 s; ingestion is bursty (max 11.2 s for a step that reads four chunks). Peak RSS **346 MB**, DB 100 MB, 0 HTTP errors, backlog high-water 19 chunks (history bootstrap), drained in 5 iterations. The behavioural changes in the last pass left these unchanged.
 **Memory** does not grow with leads or events: leads live in SQLite (the old resident map cost 128 bytes per lead), so RSS is flat at one batch plus the interpreter. Synthetic 10× shape (120 workflows, 7.7 M events/day, labelled synthetic): 87k events/s, 287 MB (previously 67k events/s, 1,125 MB). Work per iteration is bounded (4 chunks, 8 workflows), routine planning is round-robin by staleness (tested), so one hot workflow cannot starve others.
 **At 10×** the first limit is a single SQLite writer and one decode core (≈97 s of ingest per simulated day, still far below real time), then DB size (leads ≈ 1 GB / 12 days, pruned past the cadence window), then planner time (linear in workflows, capped per step). Path beyond that: `workflow_id → shard`, one worker and DB per shard; only the credit balance and the event cursor cross workflows. Not built: Kafka or distributed workers.
 
@@ -276,16 +294,16 @@ Measured on public_03_load (`reports/load_test.md`, `reports/performance.md`): t
 
 scenario `02_incidents`, SIGKILL x4, seed 7
 
-- kill 1: sim 2027-01-05T07:00:00+05:30, event cursor=40, open proposals at kill=[('nw_kyc-v1-155e06fcd024', 'PENDING')]
-- kill 2: sim 2027-01-06T23:15:00+05:30, event cursor=98, open proposals at kill=[('nw_renewal-v7-87e80e4fbcee', 'PENDING')]
-- kill 3: sim 2027-01-09T04:45:00+05:30, event cursor=147, open proposals at kill=[('nw_kyc-v2-df5872b2ac0e', 'PENDING')]
-- kill 4: sim 2027-01-11T10:45:00+05:30, event cursor=185, open proposals at kill=[]
+- kill 1: sim 2027-01-04T10:00:00+05:30, event cursor=1, open proposals at kill=[]
+- kill 2: sim 2027-01-05T12:15:00+05:30, event cursor=47, open proposals at kill=[]
+- kill 3: sim 2027-01-08T07:45:00+05:30, event cursor=118, open proposals at kill=[('nw_kyc-v2-ae126aeb8cfc', 'PENDING')]
+- kill 4: sim 2027-01-09T01:30:00+05:30, event cursor=146, open proposals at kill=[('nw_renewal-v6-5baff4e24601', 'PENDING'), ('nw_kyc-v3-df5872b2ac0e', 'PENDING')]
 - final run exit code 0
 
 - controller starts recorded in audit: 5 (4 restarts)
 - approvals in simulator: 15, unique proposal ids: 15
-- proposals by local state: {'APPLIED': 19, 'REJECTED': 1}
-- audit rows: 109 (continuous across restarts)
+- proposals by local state: {'APPLIED': 15, 'REJECTED': 2, 'ABANDONED': 1}
+- audit rows: 101 (continuous across restarts)
 - scenario finished: True
 - **violations: none**
 
@@ -315,43 +333,43 @@ scenario `02_incidents`, SIGKILL x4, seed 7
 Everything the controller decides is a row. "Why did ks_cancel change on D3, who approved it, what happened next?":
 ```
 $ python -m controller.cli --db controller_state.db explain --wf ks_cancel --at "D3 20:00"
-[ks_cancel] config v7 went live at 2027-01-07 18:45 (D3) (route: approval; dims: prompt_version)
+[ks_cancel] config v6 went live at 2027-01-07 16:00 (D3) (route: approval; dims: prompt_version)
   WHY    : Replace prompt P2 with P1 (hallucination flag rate 6.7% vs 1.5% baseline)
-           Incident inc:ks_cancel:P2:v6: 27/404 connected calls flagged on P2. P1 validated at pass_rate 0.986 (n=500, policy floor 0.97); it ran in production before with a flag rate within baseline.
+           Incident inc:ks_cancel:P2:v5: 20/298 connected calls flagged on P2. P1 validated at pass_rate 0.986 (n=500, policy floor 0.97); it ran in production before with a flag rate within baseline.
   CHANGE : {"prompt_version": {"from": "P2", "to": "P1"}}
-  SCOPE  : affected_leads=7500  impact_score=1.0  base_version=6
-  DRY RUN: {"prompt_fix": {"method": "validation run (synthetic conversations, safety only)", "n": 500, "pass_rate": 0.986, "current_prompt_production_flag_rate": 0.0668, "engagement_effect": "not mea
+  SCOPE  : affected_leads=7500  impact_score=1.0  base_version=5
+  DRY RUN: {"prompt_fix": {"method": "validation run (synthetic conversations, safety only)", "n": 500, "pass_rate": 0.986, "current_prompt_production_flag_rate": 0.0671, "engagement_effect": "not mea
   TIMELINE (from controller audit):
-    2027-01-07 17:15 (D3)  proposal_planned     [controller] Replace prompt P2 with P1 (hallucination flag rate 6.7% vs 1.5% baseline)
-    2027-01-07 17:15 (D3)  proposal_submitted   [controller] approval apr_00011 requested; expires 2027-01-08T05:15:00+05:30
-    2027-01-07 18:45 (D3)  proposal_approved    [client_approver] approved by client approver at 2027-01-07T18:19:00+05:30; apply by 2027-01-07T20:19:00+05:30
-    2027-01-07 18:45 (D3)  proposal_applied     [controller] config v7 live
-    2027-01-07 18:45 (D3)  incident_fix_applied [controller] prompt P1 live at v7; verifying
-    2027-01-08 18:45 (D4)  followup             [controller] 24h after apply: engagement_rate pre 0.4828 -> post 0.4939 (descriptive; not causal)
+    2027-01-07 14:45 (D3)  proposal_planned     [controller] Replace prompt P2 with P1 (hallucination flag rate 6.7% vs 1.5% baseline)
+    2027-01-07 14:45 (D3)  proposal_submitted   [controller] approval apr_00009 requested; expires 2027-01-08T02:45:00+05:30
+    2027-01-07 16:00 (D3)  proposal_approved    [client_approver] approved by client approver at 2027-01-07T15:38:00+05:30; apply by 2027-01-07T17:38:00+05:30
+    2027-01-07 16:00 (D3)  proposal_applied     [controller] config v6 live
+    2027-01-07 16:00 (D3)  incident_fix_applied [controller] prompt P1 live at v6; verifying
+    2027-01-08 16:30 (D4)  followup             [controller] 24h after apply: engagement_rate pre 0.5095 -> post 0.4911 (descriptive; not causal)
   THRESHOLDS: tail_prob=0.05, min_relative_lift=0.03, min_absolute_lift=0.005, harm_relative_drop=0.02, min_trials_arm=250, confirm_prob=0.9, holdout_share=0.15, provisional_share=0.5
-  EVIDENCE inc:ks_cancel:P2:v6:fix:P1: {"incident": "inc:ks_cancel:P2:v6", "detection": {"prompt": "P2", "since_version": 6, "flagged": 27, "connected": 404, "rate": 0.0668, "baseline_rate": 0.015, "b
+  EVIDENCE inc:ks_cancel:P2:v5:fix:P1: {"incident": "inc:ks_cancel:P2:v5", "detection": {"prompt": "P2", "since_version": 5, "flagged": 20, "connected": 298, "rate": 0.0671, "baseline_rate": 0.0151, "
   WHAT HAPPENED NEXT:
-    2027-01-08 09:15 (D4)  incident_resolved  flag rate 2/209=1.0% after fix (was 6.7%); incident closed
-    2027-01-08 10:15 (D4)  followup           24h after apply: engagement_rate pre 0.529 -> post 0.4572 (descriptive; not causal)
-    2027-01-08 17:15 (D4)  proposal_applied   config v8 live
-    2027-01-08 18:45 (D4)  followup           24h after apply: engagement_rate pre 0.4828 -> post 0.4939 (descriptive; not causal)
+    2027-01-07 17:00 (D3)  followup           24h after apply: engagement_rate pre 0.5238 -> post 0.5095 (descriptive; not causal)
+    2027-01-07 19:00 (D3)  incident_resolved  flag rate 4/272=1.5% after fix (was 6.7%); incident closed
+    2027-01-08 13:30 (D4)  proposal_applied   config v7 live
+    2027-01-08 16:30 (D4)  followup           24h after apply: engagement_rate pre 0.5095 -> post 0.4911 (descriptive; not causal)
 ```
 `explain` also prints the thresholds in force, the per-option verdicts (the alternatives and why they lost), the config diff and the approval timeline. Five decisions from the final runs reconstruct from it alone: a provisional promotion, its confirmation, a decay rollback (the full W3 lifecycle on nw_renewal), a caller-ID reroute and the incident fix. Other views: `supervisor` (including the evidence labels), `proposal <id>`, `log`, `health`:
 ```
 === Controller health @ 2027-01-14 00:00 (D10) ===
   metric                          last      mean      p50      p95      p99       max  n
-  t_ingest_seconds               0.005     0.017    0.005    0.030    0.046     1.575  547
-  t_governance_seconds           0.010     0.009    0.008    0.015    0.022     0.031  547
-  t_incident_seconds             0.001     0.000    0.000    0.001    0.001     0.005  547
-  t_planning_seconds             0.000     0.004    0.000    0.020    0.033     0.512  547
-  decision_lag_seconds           0.011     0.013    0.010    0.028    0.042     0.516  547
-  step_seconds                   0.016     0.030    0.019    0.052    0.067     1.587  547
-  stage_fetch_seconds            0.004     0.005    0.004    0.007    0.010     0.140  242
-  stage_decode_seconds           0.002     0.007    0.002    0.008    0.017     0.817  242
-  stage_transform_seconds        0.001     0.003    0.001    0.004    0.007     0.276  242
-  stage_aggregate_seconds        0.001     0.003    0.002    0.003    0.005     0.171  242
-  stage_db_seconds               0.002     0.004    0.003    0.006    0.009     0.126  242
-  ingest_events_per_sec          48869     33799    25079    82046   167676    193642  242
+  t_ingest_seconds               0.005     0.016    0.010    0.033    0.041     1.585  484
+  t_governance_seconds           0.007     0.009    0.008    0.014    0.022     0.032  484
+  t_incident_seconds             0.000     0.000    0.000    0.001    0.001     0.009  484
+  t_planning_seconds             0.000     0.005    0.000    0.026    0.033     0.041  484
+  decision_lag_seconds           0.008     0.014    0.010    0.035    0.042     0.055  484
+  step_seconds                   0.013     0.030    0.024    0.060    0.070     1.599  484
+  stage_fetch_seconds            0.002     0.005    0.004    0.008    0.012     0.188  244
+  stage_decode_seconds           0.002     0.007    0.002    0.008    0.016     0.823  244
+  stage_transform_seconds        0.000     0.003    0.001    0.004    0.005     0.257  244
+  stage_aggregate_seconds        0.001     0.003    0.002    0.004    0.005     0.163  244
+  stage_db_seconds               0.002     0.004    0.003    0.005    0.007     0.117  244
+  ingest_events_per_sec          23414     32798    25518    71716   173530    194417  244
 ```
 Metrics are cheap counters taken once per step, never per event. **Page on:** a proposal stuck `PLANNED` > 2 h, `incident_escalated`, `credit_skip`, `credit_spend_unrecorded`, `ingest_gap`, `sim_outage`/`controller_giving_up`, ingest not advancing for 30 minutes, process down. **Do not page on:** rejections and expiries (re-planned), `deferred` (waiting for the approver), supervisor edits, single HTTP failures, rollbacks, backlog during start-up.
 
@@ -367,16 +385,16 @@ Baseline: no-op controller on the same scenario. Reports in `reports/`.
 | nw_renewal | 0.440 | +4.7% | 0.279 | +5.7% | 0.543 | -0.5% | 6% | 51 (42) |
 | ALL | 0.402 | +9.0% | 0.263 | +6.2% | 0.541 | +2.1% | 6% | 139 (110) |
 
-**public_02** — 20 changes: 16 beneficial, 4 neutral, **0 harmful**. 17 approved, 3 judgement-call rejections, 4 auto-applies, 5 credits, incident MTTR 435 min (240 when approved first time).
+**public_02** — 17 changes: 14 beneficial, 3 neutral, **0 harmful**. 15 approved, 2 judgement-call rejections, 3 auto-applies, 5 credits, incident MTTR 270 min.
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.345 | +39.5% | 0.230 | +25.1% | 0.514 | +7.9% | 47% | 100 (330) |
-| nw_kyc | 0.442 | +17.8% | 0.283 | +16.9% | 0.593 | +0.1% | 0% | 36 (31) |
-| nw_renewal | 0.482 | +12.9% | 0.288 | +10.2% | 0.556 | +1.5% | 18% | 63 (55) |
-| ALL | 0.411 | +23.0% | 0.260 | +17.3% | 0.547 | +3.2% | 32% | 199 (416) |
+| ks_cancel | 0.348 | +40.4% | 0.233 | +26.6% | 0.511 | +7.2% | 41% | 104 (330) |
+| nw_kyc | 0.466 | +24.2% | 0.291 | +20.2% | 0.605 | +2.2% | 0% | 37 (31) |
+| nw_renewal | 0.487 | +14.2% | 0.290 | +10.9% | 0.558 | +1.9% | 14% | 68 (55) |
+| ALL | 0.419 | +25.4% | 0.264 | +18.9% | 0.549 | +3.6% | 27% | 209 (416) |
 
-**public_03** — 48 changes: 35 beneficial, 13 neutral, **0 harmful**; conclusion rate +16.2%, pickup +8.1%, engagement +5.2%; 52 approval requests over 12 workflows × 5 days, at most 3 per workflow per 24 h (per-workflow table in `reports/public_03.md`).
+**public_03** — 48 changes: 33 beneficial, 15 neutral, **0 harmful**; conclusion rate +16.5%, pickup +8.3%, engagement +5.3%; 50 approval requests over 12 workflows × 5 days, at most 3 per workflow per 24 h (per-workflow table in `reports/public_03.md`).
 
 **Defects found by reading harmful changes, all fixed as general rules** (none remain in the final runs):
 1. *Caller-ID "re-spread" onto unjudged IDs*: IDs with <200 dials were counted healthy. Fixed: unmeasured ⇒ probe share.
@@ -388,8 +406,11 @@ Baseline: no-op controller on the same scenario. Reports in `reports/`.
 7. *Recovery check leaking pre-flag dials* (found when a recovery fix started to work): recovery evidence now comes only from versions at or after the cut.
 8. *Incident submission on worst-case approver latency* delayed a safety fix by ~16 hours. Fixed: urgent fixes use best-case latency.
 9. *Malformed LLM output* (`KeyError`), and a state DB without a world key being reused. Fixed, tested.
-Reading the numbers: most of the gain is pickup (spreading volume across caller IDs and leaving degraded ones; nw_kyc is pickup-primary) plus incident handling in public_02. Engagement gains are real but small (6–32% of the headroom): at 200–400 dials an hour there are ~1,000 connected calls a day, too few to resolve a 10% lift in under several days. Public_01's decaying variant stays live to the end (its decay never reaches the demotion evidence at that volume, §13); on public_02 it is rolled back on day 6.
-**History of the scores.** First version +11.3% / +24.4% (public_01/02); after removing what I could not defend +8.0% / +21.2%; now +9.0% / +23.0% with no harmful change in any of the three scenarios. I did not tune thresholds to these numbers; every change above is a general failure class with a test.
+10. *A neutral promoted winner froze the lever*: only the winner and the control received traffic, and only a worse-than-control winner was ever acted on. Fixed: three-way outcome with limited re-exploration.
+11. *Stale cohort state*: a supervisor edit reset only the default scope, and cohort state whose cohort was deleted was skipped forever. Fixed: scoped reset by evidence start version and cleanup of orphaned scopes.
+12. *Cohort first look had no guardrail gate*, unlike a workflow-level win. Fixed (the same gate, which also makes small slices harder to qualify: with ~750 dials per arm pickup's standard error is 2.4 points).
+Reading the numbers: most of the gain is pickup (spreading volume across caller IDs and leaving degraded ones; nw_kyc is pickup-primary) plus incident handling in public_02. Engagement gains are real but small (6–27% of the headroom): at 200–400 dials an hour there are ~1,000 connected calls a day, too few to resolve a 10% lift in under several days. Public_01's decaying variant stays live to the end (at that volume the evidence never becomes strong enough to classify it, §13); on public_02 it is rolled back on day 5.
+**History of the scores.** First version +11.3% / +24.4% (public_01/02); after removing what I could not defend +8.0% / +21.2%; now +9.0% / +25.4% with no harmful change in any of the three scenarios. I did not tune thresholds to these numbers; every change above is a general failure class with a test.
 
 ## 12. Trade-offs & rejected alternatives
 | Option | Why considered | Why rejected / what instead |
@@ -410,11 +431,13 @@ Reading the numbers: most of the gain is pickup (spreading volume across caller 
 | Demote when a winner stops clearing the 3% bar | Rolls back arms that are no longer worth the complexity | Asymmetric with confirmation; rolled back good arms. Demotion now mirrors confirmation; a flat winner is harmless and is kept. |
 | Same submission rule for routine and urgent requests | Simpler | A safety fix lost ~16 h to a conservative TTL rule; urgent requests use best-case latency. |
 | Cohort overrides at 85/15 straight away | Fewer approvals | Same winner's-curse exposure as workflow winners; they now use the same confirm lifecycle. |
+| Roll back a promoted arm as soon as it stops clearing the bar | Simple | Rolled back good arms on noise (4–10%). A neutral arm is harmless, so it now reopens a 30% challenge instead: a false alarm is cheap, and the lever is no longer frozen. |
+| Reopen exploration inside cohorts too | Symmetry | One exploration process (workflow level) is easier to reason about; a neutral cohort override is harmless and stays. |
 | Property-testing library | Corner cases | A seeded standard-library model test (40 interleavings) covers the governance machine with no dependency. |
 
 ## 13. Known weaknesses
-1. **Power.** At dev scale the controller captures 6–32% of the engagement headroom; at 300 connected calls/day it declines to experiment at all; subgroup effects need more traffic than eight days provide.
-2. **A decayed winner is only rolled back when it is worse than its holdout.** Public_01's decaying variant, which fell toward the control rate, stayed live; it was harmless there, but it also stopped the lever from exploring further. In simulation an arm that decays to exactly the control rate is rolled back in only 31–47% of runs.
+1. **Power.** At dev scale the controller captures 6–27% of the engagement headroom; at 300 connected calls/day it declines to experiment at all; subgroup effects need more traffic than eight days provide.
+2. **A neutral winner is recognised only when there is enough data to say so.** Classifying "no longer clears the bar" needs roughly 800+ holdout trials in the window, so on a dev-scale workflow (public_01) the decayed variant stayed live to the end. At 4,000 calls/day exploration is reopened in a median of 1 day; at 1,000/day in 50% of runs inside the horizon.
 3. **Repeated looks** are covered by confirmation on independent data and a measured whole-policy error rate, not by a formal spending rule.
 4. **One partition axis**; welcome×voice interactions are not modelled.
 5. **Thresholds were chosen with the public grader in view** (and some, such as the incumbent share, changed because of it); the ones I could not justify independently were removed or re-derived, and the whole-policy simulation reports their behaviour on synthetic data, but hidden scenarios may want other values.
@@ -441,7 +464,7 @@ This section says what is guaranteed by construction, what is statistical, and w
 2. *Config*: the remote live configuration is authoritative; every proposal is `live config + intended diff`.
 3. *Proposal*: no proposal leaves a terminal state or applies from an invalid state (`TRANSITIONS`, DB `CHECK`).
 4. *Side effects*: every external intent has a deterministic identity and a recovery path.
-5. *Experiment*: no option becomes a final winner (workflow or cohort) without independent fresh-data confirmation; severe regressions are handled on a separate, faster path.
+5. *Experiment*: no option becomes a final winner (workflow or cohort) without independent fresh-data confirmation; severe regressions use a separate, faster path; a promoted arm that is merely no longer beneficial reopens limited exploration instead of freezing the lever.
 6. *Supervisor*: automatic behaviour never overwrites a newer supervisor decision (hold on the edited dimension, pending proposals abandoned, experiment reset).
 7. *Guardrail*: no optimisation promotion knowingly violates the guardrail; it is re-checked at decision, confirmation and during monitoring.
 8. *Safety first*: incidents and reconciliation run every step, even under backlog, and an urgent change supersedes an overlapping routine one.
@@ -457,6 +480,8 @@ This section says what is guaranteed by construction, what is statistical, and w
 | events | simulator chunks | counters + cursor | replay from the cursor; duplicates skipped by event id |
 | experiment state | local (controller memory) | `experiments` | advances only when its proposal is **applied** |
 
+**Regime-aware evidence.** Evidence is never discarded wholesale. Contrasts are stratified by config version and cohort, so a prompt change, an incident fix or another lever's change does not bias a comparison of arms that ran concurrently, and does not invalidate it. What *is* reset is scoped: after a supervisor edit of a lever, only the scopes whose evidence began before that edit are reset (a later override keeps its state); cohort scopes whose cohort has been deleted are cleaned up; caller-ID recovery uses only calls from versions at or after the cut. A reopened exploration starts a fresh evidence window (`start_ver`) with the incumbent as control.
+
 **Time.** All decisions use simulator time (`/sim/state`) and the policy's approver hours in simulator minutes; the machine clock is used only for retry sleeps and an audit timestamp. Business hours, TTL and apply windows are computed from simulator timestamps parsed against D0; no timezone conversion is done on the controller side.
 
 **Determinism.** Same simulator, same decisions, byte-for-byte audit trail, independent of the hash seed (`scripts/determinism_check.sh`; a float summation over a set was found and fixed). No randomness is used anywhere in the controller.
@@ -470,6 +495,7 @@ This section says what is guaranteed by construction, what is statistical, and w
 | 250 trials | `min_trials_arm` | slow in quiet workflows | declines to experiment rather than guessing; evidence labels say "unknown" |
 | 85/15, 50% provisional | policy | rigid | explicit choice; confirmation protects the first stage |
 | 1-day demotion window | `decay_min_blocks` | diurnal bias | evidence-driven growth; safety path for large drops |
+| a promoted winner stays good | PROMOTED phase | frozen lever when it turns neutral | three-way outcome; reopen limited exploration |
 | 99% harm stop | policy | false exile | strong evidence; permanence documented |
 | 70% incumbent share | policy | tuned to one case | labelled D, prior favouring a human choice |
 | caller-ID 200 dials | policy | thin data | unmeasured ≠ healthy |
