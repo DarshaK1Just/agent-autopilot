@@ -315,6 +315,20 @@ def test_approve_then_apply_exactly_once_even_if_reconciled_twice(store):
     assert len(sim.versions) == 2
 
 
+def test_every_applied_change_can_be_reconstructed_from_local_state_alone(store):
+    store.set_clock(1440 + 11 * 60, "x")
+    sim = FakeSim()
+    gov = _gov(store, sim)
+    gov.propose(_ctx(store), [_intent()])
+    sim.approvals[0]["status"] = "approved"
+    gov.reconcile({"w1": SPEC}, {"w1": 1})
+    p = store.one("SELECT * FROM proposals WHERE state='APPLIED'")
+    rows = store.q("SELECT proposal_id, detail FROM audit WHERE kind='proposal_applied'")
+    assert [r["proposal_id"] for r in rows] == [p["pid"]] and json.loads(rows[0]["detail"])["version"] == p["applied_version"]
+    assert json.loads(p["body"])["proposed_config"] and p["applied_version"] == sim.versions[-1]["version"]   # what, when and why are all local
+    assert [v["proposal_id"] for v in sim.versions[1:]] == [p["pid"]]                                      # and it matches the server's history
+
+
 def test_stale_base_is_terminal_and_replannable(store):
     store.set_clock(1440 + 11 * 60, "x")
     sim = FakeSim()
