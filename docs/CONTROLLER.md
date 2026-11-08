@@ -6,6 +6,7 @@ pip install -r requirements.txt                      # numpy, httpx (+ sim deps)
 python -m sim serve --scenario scenarios/public_01_dev.yaml --run-dir runs/mine --force
 ./run.sh http://127.0.0.1:8700                      # state in ./controller_state.db (override: CONTROLLER_DB=...)
 python -m pytest -q tests
+scripts/determinism_check.sh                        # same audit trail under different hash seeds
 scripts/run_scenario.sh 01_dev                      # serve + run + grade -> reports/public_01.md  (needs runs/base_public_<name> from `make baseline`)
 .venv/bin/python scripts/crash_demo.py --kills 4    # SIGKILL/restart demo -> reports/crash_recovery.md
 ```
@@ -40,7 +41,15 @@ python -m controller.cli --db controller_state.db log --wf ks_cancel --limit 60
 **Do not page on:** rejected/expired proposals (re-planned automatically), `deferred` (waiting for approver hours), supervisor edits, single failed HTTP calls (retried).
 
 ## Invariants
-1. Ingest cursor and counters commit together. 2. A proposal row is `PLANNED` before any request; its id is `wf-v<base>-<config fingerprint>[-rN]`. 3. Proposal state changes only through `Governor._move` against the `TRANSITIONS` table (and a DB `CHECK`); apply is only attempted from `APPROVED`. 4. Experiment state advances only when its proposal is **applied**. 5. One routine proposal in flight per workflow; an urgent one may go alongside it only on disjoint dimensions (overlap supersedes the routine one); one urgent at a time. 6. Customer-facing changes never auto-apply unless protective. 7. State from another simulator world is archived, never reused.
+1. A committed cursor implies all counters through it are committed (one transaction per chunk).
+2. The remote live config is authoritative; proposals are `live config + intended diff`.
+3. Proposal state changes only through `Governor._move` against `TRANSITIONS` (and a DB `CHECK`); apply is attempted only from `APPROVED`.
+4. Every external intent has a deterministic id and a recovery path; the proposal row is written before the request.
+5. Experiment state advances only when its proposal is **applied**; no option (workflow or cohort) becomes a final winner without confirmation on fresh data; demotion mirrors confirmation; severe regressions use a separate fast path.
+6. One routine proposal in flight per workflow; an urgent one may go alongside only on disjoint dimensions (overlap supersedes the routine one); one urgent at a time.
+7. Customer-facing changes never auto-apply unless protective.
+8. Incidents and reconciliation run every iteration, including under backlog; routine planning pauses while evidence is incomplete.
+9. State from a different simulator world is archived, never reused. No randomness anywhere: the audit trail is identical across hash seeds.
 
 ## Known sharp edges
 - Credits spent between the simulator charging and our commit are lost on a crash at that exact instant (the result is not retrievable).
@@ -48,3 +57,4 @@ python -m controller.cli --db controller_state.db log --wf ks_cancel --limit 60
 
 ## Measurements
 `scripts/bench_ingest.py` (synthetic events, not simulator runs) for ingest cost and memory at 1× and 10× shapes; `scripts/false_winner_sim.py` for the decision rule's behaviour under repeated looks; `controller.cli health` prints per-stage latency percentiles for a finished run. Numbers and plans are in `reports/performance.md`.
+`scripts/policy_sim.py` runs the real planner through simulated days (false promotion, power, regression detection; `reports/policy_operating_characteristics.md`).
