@@ -26,7 +26,10 @@ SPEC = {"workflow_id": "w1", "options": {"voice": ["V1", "V2", "V3", "V4"], "wel
         "objective": {"primary": "engagement_rate", "guardrail": {"pickup_rate_max_drop": 0.02}}}
 CFG = {"cohorts": [], "allocations": {"default": {"welcome_message": {"W1": 1.0}, "voice": {"V1": 1.0}, "caller_id": {"D1": 1.0}}},
        "prompt_version": "P1", "schedule": {"hour_weights": {}, "lead_preferred_hour": {}}}
-BASE, DAYS, CHANGE_BLK = 0.5, 8, 16   # the regime changes at block 16 (day 4) in the shift scenarios
+import os  # noqa: E402
+BASE = 0.5
+DAYS = int(os.environ.get("PS_DAYS", 8))                  # horizon in days
+CHANGE_BLK = int(os.environ.get("PS_CHANGE_BLK", 16))      # the regime changes at this 6-hour block (16 = day 4) in the shift scenarios
 
 # true relative lift of each arm over the control (V1) before / after the change
 SCENARIOS = {
