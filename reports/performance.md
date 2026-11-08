@@ -7,28 +7,28 @@ One loop iteration = one simulated step (15 or 60 simulated minutes). 354 steps,
 
 | stage | mean | p50 | p95 | p99 | max |
 |---|---:|---:|---:|---:|---:|
-| `T_fetch` (HTTP stream of a chunk, per ingesting step) | 0.07 s | 0.03 | 0.11 | 1.26 | 1.73 |
-| `T_decode` (JSON) | 0.23 s | 0.05 | 0.50 | 4.45 | 4.73 |
-| `T_transform` (field extraction, interning) | 0.10 s | 0.03 | 0.32 | 2.03 | 2.04 |
-| `T_aggregate` (numpy group-by) | 0.03 s | 0.01 | 0.05 | 0.64 | 0.66 |
-| `T_db` (lead insert/lookup, counter upsert, commit) | 0.12 s | 0.04 | 0.25 | 2.05 | 2.52 |
-| **ingestion, whole step** | 0.38 s | 0.15 | 0.68 | 10.7 | 18.9 |
-| `T_governance` (reconcile: poll approvals, apply) | 0.05 s | 0.04 | 0.06 | 0.11 | 2.05 |
-| `T_incident` (all workflows, every step) | 0.001 s | 0.001 | 0.002 | 0.003 | 0.004 |
-| `T_planning` (routine planners, ≤8 workflows) | 0.007 s | 0.000 | 0.03 | 0.05 | 0.10 |
-| **decision path (governance + incident + planning)** | **0.06 s** | **0.04** | **0.09** | **0.13** | **2.05** |
+| `T_fetch` (HTTP stream of a chunk, per ingesting step) | 0.06 s | 0.03 | 0.10 | 0.88 | 1.08 |
+| `T_decode` (JSON) | 0.20 s | 0.05 | 0.43 | 4.33 | 4.50 |
+| `T_transform` (field extraction, interning) | 0.09 s | 0.02 | 0.29 | 1.59 | 1.65 |
+| `T_aggregate` (numpy group-by) | 0.03 s | 0.01 | 0.04 | 0.61 | 0.63 |
+| `T_db` (lead insert/lookup, counter upsert, commit) | 0.10 s | 0.03 | 0.22 | 1.78 | 1.96 |
+| **ingestion, whole step** | 0.29 s | 0.01 | 0.56 | 8.6 | 14.4 |
+| `T_governance` (reconcile: poll approvals, apply) | 0.03 s | 0.03 | 0.06 | 0.09 | 0.12 |
+| `T_incident` (all workflows, every step) | 0.001 s | 0.001 | 0.002 | 0.003 | 0.005 |
+| `T_planning` (routine planners, ≤8 workflows) | 0.005 s | 0.000 | 0.02 | 0.05 | 0.11 |
+| **decision path (governance + incident + planning)** | **0.04 s** | **0.03** | **0.07** | **0.10** | **0.14** |
 
 Reading it: ingestion is bursty (a step that finds a day's worth of chunks costs seconds; most steps cost milliseconds). The decision path never exceeds 0.2 s and does not grow with ingest volume, because it reads counters, not events. `T_external` (the HTTP round trips for polling approvals, proposals and applies) is inside `T_governance` and is loopback-fast here; on a real network it would be the dominant term, bounded by the client's timeouts (connect 5 s, read 120 s) and at most 5 retries for reads only.
-Where the time goes inside ingestion (summed over the run, 96.5 s of the 117.1 s spent ingesting; the rest is chunk listing and bookkeeping): JSON decode 41%, SQLite 21%, transform 19%, fetch 13%, numpy aggregation 6%.
+Where the time goes inside ingestion (summed over the run, 86.1 s of the 92.5 s spent ingesting; the rest is chunk listing and bookkeeping): JSON decode 42%, SQLite 21%, transform 18%, fetch 12%, numpy aggregation 6%.
 
 ## 2. Throughput and memory, public_03
 | metric | value |
 |---|---|
 | events ingested | 9.74 M (5.54 M history bootstrap + 4.20 M live) |
-| wall clock, whole run | 3 min 08 s |
-| ingest rate (events per second of ingest time) | mean 83.7k, p50 84.3k, max 162k |
-| peak RSS | 347 MB (previous design: 483 MB) |
-| RSS at steady state | 290–315 MB, flat across the run |
+| wall clock, whole run | 2 min 47 s |
+| ingest rate (events per second of ingest time) | mean 94.3k, p50 95.1k, max 178k |
+| peak RSS | 345 MB (previous design: 483 MB) |
+| RSS at steady state | ≈ 250–300 MB, flat across the run |
 | SQLite size | 99.5 MB after 12 simulated days × 12 workflows |
 | HTTP errors / retries | 0 / 0 |
 | backlog high-water | 19 chunks (the history bootstrap), drained 4 chunks per tick |
@@ -81,17 +81,17 @@ If events arrive faster than they are processed, the backlog is the number of un
 | ingest cost per simulated day (measured/derived) | 11 s | 97 s (synthetic 88 s) | ~16 min, one core |
 | heap | ~300 MB | ~300 MB (batch-bound) | ~300 MB per worker |
 | SQLite | 100 MB / 12 days | ~1 GB / 12 days (leads dominate; pruned after the cadence window) | per shard |
-| decision path | 0.05 s / step | ~0.5 s / step (linear in workflows; routine planning is capped at 8 workflows per step) | per shard |
+| decision path | 0.04 s / step | ~0.4 s / step (linear in workflows; routine planning is capped at 8 workflows per step) | per shard |
 | what limits it | nothing | single-writer SQLite and one core for decode | needs sharding |
 Migration path: `workflow_id → shard`. Everything stored is keyed by workflow, so a worker owning a set of workflows needs only its own SQLite file, its own cursor over the event stream filtered to its workflows, and read access to the shared items below. Global state is explicit and small: the simulator's `/sim/state` credit balance (spent only inside `incidents.py`), the world key, the event cursor (would become one cursor per shard) and the approver request counts (derived per workflow from `proposals`). Not built: Kafka, a work queue or distributed workers. At the assignment's scale they add failure modes without removing a bottleneck.
 
 ## 8. Performance budgets (derived from the required scale)
 | budget | target | measured |
 |---|---|---|
-| sustained ingest | ≥ 5,000 events/s (≥ 250× the peak real-time need of ~20 events/s) | 84k/s |
-| decision path per step, p99 | < 1 s (decisions are acted on at 15-minute granularity) | 0.13 s |
-| one tick's ingest, max | < 30 s (bounded by `max_chunks_per_tick`) | 18.9 s |
-| RSS | < 1 GB on the 8 GB evaluator box | 347 MB peak |
+| sustained ingest | ≥ 5,000 events/s (≥ 250× the peak real-time need of ~20 events/s) | 94k/s |
+| decision path per step, p99 | < 1 s (decisions are acted on at 15-minute granularity) | 0.10 s |
+| one tick's ingest, max | < 30 s (bounded by `max_chunks_per_tick`) | 14.4 s |
+| RSS | < 1 GB on the 8 GB evaluator box | 345 MB peak |
 | DB growth | < 15 MB per simulated day at 12 workflows | ~8 MB/day |
 | backlog recovery | ≥ 1 M events per iteration | 1 M |
 
@@ -104,6 +104,3 @@ Migration path: `workflow_id → shard`. Everything stored is keyed by workflow,
 | decision → applied | ≤ 15 min | polling granularity (15 simulated minutes while anything is pending) |
 | applied → verified | 3 h | verification sample size (not part of MTTR) |
 MTTR (grader) 240 min, of which the controller owns detection (shortenable only by weakening the false-positive guard) and the ≤15-minute apply step. Prompt changes cannot be auto-applied under any public policy (`allowed_dims` never contains `prompt_version`), so the approver wait is not reducible.
-
-## 10. A note on the one slow governance step
-`T_governance` has a 2.05 s maximum against a 0.11 s p99: a single reconcile step that issued several HTTP round trips and a `COUNT` over the leads table for `affected_leads`. It happens once in 331 steps and is bounded (no loop, no retry storm); it is the only decision-path step above 0.2 s.
