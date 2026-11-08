@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 controller_state.db*
 reports/*.tmp
+docs/INTERVIEW_PREP.md
+.claude/
+*.log

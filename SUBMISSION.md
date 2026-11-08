@@ -1,15 +1,12 @@
 # Outcome-First Agent Loop — Submission
 
-**Name:** [fill in] · **Date:** 2026-11-07 · **Hours actually spent (be honest):** [fill in] · **Language / storage:** Python 3.10 (numpy, httpx) / SQLite (WAL), no new dependencies
-
-> Copy this file to `SUBMISSION.md`. Keep the headings. Be concrete: numbers, examples, diagrams. If a
-> section doesn't apply, say why in a line rather than deleting it.
+**Name:** Darshak Kakani · **Date:** 2026-11-08 · **Hours actually spent (be honest):** 6 to 7 · **Language / storage:** Python 3.10 (numpy, httpx) / SQLite (WAL), no new dependencies
 
 ---
 
 ## 0. TL;DR
 A single-process controller. It keeps per-arm counters from the event stream in SQLite (one transaction per chunk, memory bounded by a batch), runs randomised welcome/voice tests with one deterministic Bayesian rule plus confirmation on fresh data (workflow winners and cohort overrides alike), reopens limited exploration when a promoted arm stops being better, reroutes degraded caller IDs, answers hallucination incidents (previous prompt first, LLM only if needed), and sends every change through an explicit proposal state machine with deterministic ids.
-public_01 +9.0% conclusion rate vs baseline (8 changes, 0 harmful); public_02 +25.4% (17 changes, 0 harmful, hallucinated calls 416→209, 5 credits); public_03 +16.5% in 2 min 37 s, 346 MB peak (48 changes, 0 harmful). Whole-policy simulation: 1% false promotion under the null, ~1.1 proposals per run.
+public_01 +9.0% conclusion rate vs baseline (8 changes, 0 harmful); public_02 +25.4% (17 changes, 0 harmful, hallucinated calls 416→209, 5 credits); public_03 +16.5% in 2 min 37–42 s, 346 MB peak (48 changes, 0 harmful). Whole-policy simulation: 1% false promotion under the null, ~1.1 proposals per run.
 Four SIGKILLs mid-run: no duplicate, no lost proposal, one continuous audit trail; identical audit trail across hash seeds. Decision path p99 0.10 s; ingest 94k events/s.
 Not built: call-time optimisation, cross-axis cohorts, UI, cross-tenant credit arbitration.
 Weakest points: little statistical power at dev scale (6–27% of the engagement headroom); a neutral winner is only recognised once there is enough data to say so, so on small workflows it can stay live for days.
@@ -284,7 +281,7 @@ The table is `TRANSITIONS` in `governance.py`; every state change goes through o
 * **Where the time goes.** ~195 min detection (the statistical sample plus the 45-minute second look), <1 min validation, ~75 min approver latency (20–120 min, policy). If the approver randomly rejects the first request (5% base rate) the fix is re-submitted in the same step: 435 min in an earlier run of the same incident, versus 1,365 min before urgent requests used best-case latency. Detection and the retry rule are controller-controlled; approver latency and rejections are not, and no public policy lets a prompt be auto-applied.
 
 ## 8. Scale
-Measured on public_03_load (`reports/load_test.md`, `reports/performance.md`): the whole run — 7 history days + 5 live days, 12 workflows, 9.74 M events, simulator on the same box — took **2 min 37 s** (≈ 31 s per live simulated day against the 10-minute budget). Ingest 90k events/s (mean over ingest time, max 174k). Decision path per step: mean 0.04 s, p95 0.07 s, p99 0.105 s, max 0.144 s; ingestion is bursty (max 11.2 s for a step that reads four chunks). Peak RSS **346 MB**, DB 100 MB, 0 HTTP errors, backlog high-water 19 chunks (history bootstrap), drained in 5 iterations. The behavioural changes in the last pass left these unchanged.
+Measured on public_03_load (`reports/load_test.md`, `reports/performance.md`): the whole run — 7 history days + 5 live days, 12 workflows, 9.74 M events, simulator on the same box — took **2 min 37–42 s** (≈ 31 s per live simulated day against the 10-minute budget). Ingest 90k events/s (mean over ingest time, max 174k). Decision path per step: mean 0.04 s, p95 0.07 s, p99 0.105 s, max 0.144 s; ingestion is bursty (max 11.2 s for a step that reads four chunks). Peak RSS **346 MB**, DB 100 MB, 0 HTTP errors, backlog high-water 19 chunks (history bootstrap), drained in 5 iterations. The behavioural changes in the last pass left these unchanged.
 **Memory** does not grow with leads or events: leads live in SQLite (the old resident map cost 128 bytes per lead), so RSS is flat at one batch plus the interpreter. Synthetic 10× shape (120 workflows, 7.7 M events/day, labelled synthetic): 87k events/s, 287 MB (previously 67k events/s, 1,125 MB). Work per iteration is bounded (4 chunks, 8 workflows), routine planning is round-robin by staleness (tested), so one hot workflow cannot starve others.
 **At 10×** the first limit is a single SQLite writer and one decode core (≈97 s of ingest per simulated day, still far below real time), then DB size (leads ≈ 1 GB / 12 days, pruned past the cadence window), then planner time (linear in workflows, capped per step). Path beyond that: `workflow_id → shard`, one worker and DB per shard; only the credit balance and the event cursor cross workflows. Not built: Kafka or distributed workers.
 
@@ -506,3 +503,4 @@ This section says what is guaranteed by construction, what is statistical, and w
 
 **What cannot be guaranteed** (statistics or the contract, not design): that a small effect is found in a short horizon; that an approver approves, or when; that a hallucination fix also preserves engagement (validation measures safety only); that credit-charged results survive a crash at the exact instant; that SQLite survives disk loss.
 
+**Closure audit.** `reports/final_audit.md` lists the ten hidden failures I judged most plausible, with the verdict on each (no correctness bug found; one accepted trade-off on a duplicated event id inside a single chunk; one information limit), the numbers behind the low-volume limit, and the invariant-to-test map. `reports/low_volume_experiments.md` records the remedies I measured and rejected.
