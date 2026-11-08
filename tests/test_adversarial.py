@@ -508,3 +508,14 @@ def test_recovery_ignores_dials_from_before_the_id_was_cut(store):
     store.run("INSERT INTO agg VALUES('w1',7,2,'default','caller_id','D4','all','',120,10,0)")     # after the cut (version 2): 8% pickup, only 120 dials
     store.put("did_bad:w1", {"D4": {"minute": 0, "version": 2}})
     assert plan_caller_id(ctx, -10**9) == []     # not enough post-cut evidence, and what there is says it is still bad
+
+
+def test_urgent_fix_is_sent_when_the_fastest_approver_could_decide_in_time_but_routine_waits(store):
+    from controller.governance import Governor
+    spec = copy.deepcopy(SPEC)
+    spec["governance"]["proposal_ttl_hours"] = 12
+    store.set_clock(1440 + 17 * 60 + 15, "x")           # 17:15, approver hours 10-19, latency 30-120 min
+    ctx = WfCtx(store, spec, copy.deepcopy(CFG), 1, store.now_minute, 10**5, POL)
+    gov = Governor(store, None, POL, lambda ts: 0, lambda wf, info: 1)
+    assert gov.can_submit(ctx, urgent=True)[0]           # best case 17:45 -> decided today
+    assert not gov.can_submit(ctx, urgent=False)[0]      # worst case 19:15 -> tomorrow 10:00, past the 12h TTL

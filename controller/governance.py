@@ -94,9 +94,13 @@ class Governor:
     def can_submit(self, ctx: WfCtx, urgent: bool) -> tuple[bool, str]:
         g, pol = ctx.spec["governance"], self.pol
         now = self.s.now_minute
-        worst_decision = next_working(now + g["approver_latency_minutes"][1], g["approver_hours"])
-        if worst_decision - now > g["proposal_ttl_hours"] * 60 - 15:
-            return False, "worst-case decision time falls after proposal TTL (approver offline)"
+        # Routine changes can wait, so they are sent only if even the slowest approver would decide inside the TTL. A safety
+        # fix cannot wait for the next window: it is sent if the *fastest* approver could still decide in time. If it expires,
+        # the cost is one request slot (one is reserved for incidents) and the same wait we would have chosen anyway.
+        latency = g["approver_latency_minutes"][0 if urgent else 1]
+        decision = next_working(now + latency, g["approver_hours"])
+        if decision - now > g["proposal_ttl_hours"] * 60 - 15:
+            return False, f"{'best' if urgent else 'worst'}-case decision time falls after proposal TTL (approver offline)"
         slots = g["max_requests_per_24h"] - (0 if urgent else pol.incident_slots)
         if self.submitted_last_24h(ctx.wf) + 1 > slots:
             return False, f"request budget ({g['max_requests_per_24h']}/24h, {pol.incident_slots} reserved for incidents)"

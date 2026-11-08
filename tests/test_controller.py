@@ -345,9 +345,9 @@ def test_routine_request_waits_for_late_morning_and_respects_ttl(store):
     assert _gov(store, sim).can_submit(_ctx(store), urgent=False)[0]
     spec = copy.deepcopy(SPEC)
     spec["governance"]["proposal_ttl_hours"] = 6
-    ctx = WfCtx(store, spec, CFG, 1, 1440 + 18 * 60, 10 * 1440, POL)
-    store.set_clock(1440 + 18 * 60, "x")
-    assert not _gov(store, sim).can_submit(ctx, urgent=True)[0]  # decision would land after the approver went home
+    ctx = WfCtx(store, spec, CFG, 1, 1440 + 18 * 60 + 50, 10 * 1440, POL)
+    store.set_clock(1440 + 18 * 60 + 50, "x")
+    assert not _gov(store, sim).can_submit(ctx, urgent=True)[0]  # even the fastest approver would decide after going home
 
 
 def test_customer_facing_change_takes_approval_route_even_if_policy_allows_auto(store):
