@@ -124,29 +124,23 @@ def test_early_false_winner_does_not_starve_the_unresolved_arm_and_is_withdrawn(
     assert out.kind == "unconfirmed"
 
 
-def test_expired_harm_stop_brings_the_arm_back_but_a_fresh_one_does_not(store):
-    ctx = _exploring(store, v2=(300, 150), v3=(300, 150), ctl=(600, 300))
-    ctx.cfg["allocations"]["default"]["voice"] = {"V1": 0.5, "V2": 0.5}
-    ctx.minute = 5 * 1440
-    save_exp(store, "w1", "voice", {"scopes": {"default": {"phase": "EXPLORING", "control": "V1", "start_ver": 2}}, "retired": {}, "dropped": {"V3": 0}})
-    (back,) = plan_lever(ctx, "voice", held=False)
-    assert back.kind == "reintroduce" and "V3" in back.patch["allocations"]["default"]["voice"]
-    save_exp(store, "w1", "voice", {"scopes": {"default": {"phase": "EXPLORING", "control": "V1", "start_ver": 2}}, "retired": {},
-                                    "dropped": {"V3": ctx.minute - 60}})
-    assert plan_lever(ctx, "voice", held=False) == []
+def test_a_harm_stop_needs_99_percent_evidence(store):
+    ctx = _exploring(store)
+    counts = {(2, "default", "V1"): (3000, 1000, 500), (2, "default", "V2"): (3000, 1000, 450), (2, "default", "V3"): (3000, 1000, 410)}
+    rows, win, harm = _decide(ctx, counts, ["V1", "V2", "V3"], "V1", {})
+    assert rows["V2"]["status"] == "undecided" and rows["V3"]["status"] == "harmful" and harm == ["V3"]   # ~96% is not enough to exile an arm
 
 
-def test_a_rolled_back_winner_is_not_re_offered_automatically(store):
-    ctx = _exploring(store, v2=(300, 150), v3=(300, 150), ctl=(600, 300))
-    ctx.cfg["allocations"]["default"]["voice"] = {"V1": 0.5, "V2": 0.5}
-    ctx.minute = 9 * 1440
-    save_exp(store, "w1", "voice", {"scopes": {"default": {"phase": "EXPLORING", "control": "V1", "start_ver": 2}}, "retired": {"V3": 0}, "dropped": {}})
-    assert plan_lever(ctx, "voice", held=False) == []
+def test_withdrawal_never_re_offers_a_harm_stopped_arm(store):
+    ctx = _confirming(store, (1600, 720), (800, 400))
+    save_exp(store, "w1", "voice", {**load_exp(ctx, "voice"), "dropped": {"V3": 0}})
+    (intent,) = plan_lever(ctx, "voice", held=False)
+    assert intent.kind == "unconfirmed" and "V3" not in intent.patch["allocations"]["default"]["voice"]
 
 
 # ------------------------------------------------------------------- families I, J, K: decay, severe regression, guardrail
-def test_busy_workflow_is_demoted_after_one_day_of_evidence(store):
-    rows = {b: ((1000, 540), (200, 108)) for b in range(5, 9)}  # 4 blocks = 24h, flat winner, 800 control trials
+def test_busy_workflow_demotes_a_losing_winner_after_one_day_of_evidence(store):
+    rows = {b: ((1000, 500), (200, 112)) for b in range(5, 9)}  # 4 blocks = 24h: winner 50% vs holdout 56%, 800 control trials
     (intent,) = plan_lever(_put_promoted(store, rows), "welcome_message", held=False)
     assert intent.kind == "rollback"
 

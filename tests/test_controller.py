@@ -608,12 +608,18 @@ def _promoted(store, winner_rates, ctl_rates):
     return WfCtx(store, SPEC, cfg, 2, 2 * 1440, 10 * 1440, POL)
 
 
-def test_winner_that_stopped_winning_is_rolled_back(store):
+def test_winner_that_became_worse_than_its_holdout_is_rolled_back(store):
     from controller.planner import plan_lever
-    ctx = _promoted(store, (1000, 540), (200, 108))  # both arms at 54%: the lift is gone
+    ctx = _promoted(store, (1000, 500), (200, 112))  # winner 50% vs holdout 56%: it now loses
     intents = plan_lever(ctx, "welcome_message", held=False)
     assert [i.kind for i in intents] == ["rollback"] and intents[0].urgent
     assert cfgutil.eff(cfgutil.apply_patch(ctx.cfg, intents[0].patch), "default", "welcome_message")["W1"] >= 0.5
+
+
+def test_flat_winner_is_kept_demotion_mirrors_confirmation(store):
+    from controller.planner import plan_lever
+    ctx = _promoted(store, (1000, 540), (200, 108))  # identical rates: harmless, so no approval request is spent on it
+    assert plan_lever(ctx, "welcome_message", held=False) == []
 
 
 def test_winner_that_still_wins_is_kept_even_if_below_its_promotion_lift(store):

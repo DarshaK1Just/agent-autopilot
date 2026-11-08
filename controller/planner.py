@@ -191,15 +191,10 @@ def _contrast_row(c: stats.Contrast) -> dict:
 
 
 # --------------------------------------------------------------------------------------- experiments
-def _dropped(ctx: WfCtx, st: dict) -> set:
-    """Options stopped as harmful that are still inside the retirement period (the evidence expires: one noisy opening
-    must not exile a good arm for good)."""
-    return {o for o, m in st["dropped"].items() if m + ctx.pol.retire_minutes > ctx.minute}
-
-
-def _benched(ctx: WfCtx, st: dict) -> set:
-    """Options that must not be (re-)offered right now: harm-stopped or rolled back within the retirement period."""
-    return _dropped(ctx, st) | {o for o, m in st["retired"].items() if m + ctx.pol.retire_minutes > ctx.minute}
+def _dropped(st: dict) -> set:
+    """Options stopped as credibly harmful for this lever. A stop needs 99% evidence, so it is kept for the run: re-testing a
+    bad arm costs more than the (rare) false stop it would repair."""
+    return set(st["dropped"])
 
 
 def plan_lever(ctx: WfCtx, dim: str, held: bool) -> list[Intent]:
@@ -241,7 +236,7 @@ def plan_lever(ctx: WfCtx, dim: str, held: bool) -> list[Intent]:
 def _start_explore(ctx: WfCtx, dim: str, st: dict, cur_def: dict) -> list[Intent]:
     pol = ctx.pol
     ctl = cfgutil.modal(cur_def)
-    opts = [o for o in ctx.spec["options"][dim] if o == ctl or o not in _dropped(ctx, st)]
+    opts = [o for o in ctx.spec["options"][dim] if o == ctl or o not in _dropped(st)]
     k = len(opts)
     if k < 2:
         return []
@@ -282,7 +277,7 @@ def _decide(ctx: WfCtx, counts: dict, opts: list[str], ctl: str, retired: dict):
         dmin, dh = lift_bar(pol, c.rate_ctl), harm_bar(pol, c.rate_ctl)
         p_win, p_harm = c.p_greater(dmin), 1.0 - c.p_greater(-dh)
         row = {**_contrast_row(c), "p_lift_gt_min": round(p_win, 4), "p_harm": round(p_harm, 4), "need": round(need, 4)}
-        if p_harm >= pol.harm_confidence:
+        if p_harm >= pol.harm_stop_confidence:
             row["status"] = "harmful"
             harm.append(o)
         elif p_win >= need and (retired.get(o, -10**9) + pol.retire_minutes < ctx.minute):
@@ -301,7 +296,7 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
     pol, opts = ctx.pol, ctx.spec["options"][dim]
     ds = st["scopes"]["default"]
     ctl = ds["control"]
-    dropped = _dropped(ctx, st)
+    dropped = _dropped(st)
     counts = ev.arm_counts(ctx.store, ctx.wf, dim, min_ver=ds["start_ver"], cohs=["default"])
     rows, win, harm = _decide(ctx, counts, [o for o in opts if o not in dropped], ctl, st["retired"])
     cur = cfgutil.dist(ctx.cfg, "default", dim)
@@ -330,14 +325,6 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         if len(target) >= 2 and cfgutil.tv(cur, target) > 0.02:
             patch["allocations"]["default"] = {dim: target}
             kinds.append("harm_stop")
-    else:
-        benched = _benched(ctx, st)
-        # Only arms stopped on early harm evidence that has since expired come back. A rolled-back winner has a measured record
-        # of decay and is not re-offered automatically.
-        back = [o for o in st["dropped"] if o in opts and o not in cur and o not in benched and o != ctl]
-        if back:  # earlier harm evidence has expired: offer the arm again (a noisy opening is not a verdict)
-            patch["allocations"]["default"] = {dim: explore_dist([o for o in opts if o not in benched], ctl, pol.explore_control_share)}
-            kinds.append("reintroduce")
     c_int = _cohort_candidates(ctx, dim, st, ds, a0, set(harm) | dropped)
     if c_int:
         patch["cohorts_add"] = [{"id": cid, "where": w} for cid, (w, _, _) in c_int.items()]
@@ -365,8 +352,6 @@ def _evaluate_exploring(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         summary_bits.append(f"Stop harmful {dim} options {harm}")
     if "cohort" in kinds:
         summary_bits.append(f"Provisionally tailor {dim} for cohorts {', '.join(cohorts_add)} (to be confirmed on fresh data)")
-    if "reintroduce" in kinds:
-        summary_bits.append(f"Offer {dim} options {back} again (earlier harm evidence expired)")
     conf = rows[a0]["p_lift_gt_min"] if win else max([e[2]["p_win"] for e in c_int.values()] or [0.5])
     return [Intent(ctx.okey("+".join(kinds), dim, patch, ds["start_ver"]), "+".join(kinds), ctx.wf, (dim,) if patch else (),
                    patch, "; ".join(summary_bits),
@@ -424,7 +409,7 @@ def _withdraw_patch(ctx: WfCtx, dim: str, st: dict, scope: str, w: str, ctl: str
     """Allocation patch + state update that take a withdrawn/rolled-back arm out of one scope."""
     pol, opts = ctx.pol, ctx.spec["options"][dim]
     if scope == "default":
-        live = [o for o in opts if o != w and o not in _dropped(ctx, st)]
+        live = [o for o in opts if o != w and o not in _dropped(st)]
         target = explore_dist(live, ctl, pol.explore_control_share) if len(live) >= 2 else {ctl: 1.0}
         return ({"allocations": {"default": {dim: target}}}, {"phase": "EXPLORING", "control": ctl, "start_ver": "$V"}, {})
     # A cohort falls back to its own known control, not to the default allocation (which may be an exploration mix that
@@ -537,8 +522,8 @@ def _trailing_counts(ctx: WfCtx, dim: str, scope: str, start_ver: int, blocks: i
 
 def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
     """Compare each promoted winner with its holdout and roll it back when it stops winning.
-    Two paths: SAFETY (a large drop or a collapsed guardrail, acted on within hours and ~100 trials) and DECAY (the arm no
-    longer clears the practical bar; judged on the smallest trailing window that holds at least one full day and the same
+    Two paths: SAFETY (a large drop or a collapsed guardrail, acted on within hours and ~100 trials) and DECAY (the arm is no
+    longer better than its holdout, the mirror of the confirmation test; judged on the smallest trailing window that holds at least one full day and the same
     sample a promotion needs, so busy workflows react in a day and quiet ones wait for the evidence)."""
     pol = ctx.pol
     out_patch: dict = {"allocations": {}}
@@ -564,17 +549,17 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
                 cr = ev.stratified(counts, w, ctl, ctx.primary, ctx.prior)
                 if cr is None or min(cr.n_arm, cr.n_ctl) < pol.min_trials_arm or not enough_events(pol, cr):
                     continue
-                p_still = cr.p_greater(lift_bar(pol, cr.rate_ctl))
+                p_still = cr.p_greater(0.0)   # P(the arm is still better than its holdout)
                 p_harm = 1.0 - cr.p_greater(-harm_bar(pol, cr.rate_ctl))
                 breach, gd = _guard_breach(ctx, counts, w, ctl, pol.harm_confidence, pol.min_trials_arm)
-                detail = {"window_blocks": k, "recent": _contrast_row(cr), "p_still_clears_practical_lift": round(p_still, 3),
+                detail = {"window_blocks": k, "recent": _contrast_row(cr), "p_still_better_than_holdout": round(p_still, 3),
                           "p_harmful": round(p_harm, 3), "guardrail": gd}
                 if p_harm >= pol.harm_confidence:
                     why = "credibly harmful"
                 elif breach:
                     why = "guardrail breached"
-                elif p_still <= pol.decay_p:
-                    why = f"no longer clears the practical bar (P={p_still:.2f})"
+                elif p_still <= 1 - pol.confirm_prob:   # mirror of confirmation: demote only on equally strong evidence against
+                    why = f"no longer better than its holdout (P(better)={p_still:.2f})"
                 break
         evd[scope] = detail
         if why:

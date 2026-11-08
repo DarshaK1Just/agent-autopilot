@@ -18,6 +18,7 @@ class Policy:
     severe_relative_drop: float = 0.10         # B: a promoted arm 10% (relative) below its holdout is a regression, not a decay
     severe_confidence: float = 0.99            # D: safety path: fast, but only on strong evidence
     severe_min_trials: int = 100               # D: smaller sample allowed on the safety path because the effect required is large
+    harm_stop_confidence: float = 0.99     # D: a harm stop lasts the whole run, so it needs stronger evidence than a one-off decision
     harm_confidence: float = 0.95          # C: 1 - alpha
     tail_prob: float = 0.05                    # D: Bayesian: tolerated posterior tail probability, split by Bonferroni over the comparisons made at one look. Not a classical error guarantee: see reports/false_winner_rate.md for the measured behaviour under repeated looks
     guardrail_confidence: float = 0.80     # D: block only when there is >= 20% posterior chance the guardrail breaches its tolerance
@@ -26,7 +27,7 @@ class Policy:
     min_cohort_gain: float = 0.004         # D: ... and add >= 0.4pt absolute KPI
     max_cohorts: int = 6                   # D
     decay_min_blocks: int = 4              # D: demotion looks at >= 1 full day (4 x 6h blocks) so the whole dialling-hour mix is covered
-    decay_p: float = 0.20                  # D: roll back when P(winner still clears the practical-lift bar vs its holdout) <= 20%
+    decay_p: float = 0.20                  # D: only used to label evidence (every challenger P(clears the bar) <= 20% = NO_PRACTICAL_EFFECT)
     retire_minutes: int = 3 * 1440         # D: a rolled-back option is not re-promoted for 3 days
     # --- caller id
     did_window_blocks: int = 6             # D: 36h
