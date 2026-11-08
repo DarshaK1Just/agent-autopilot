@@ -18,7 +18,7 @@ def eff(cfg: dict, k: str, dim: str) -> dict[str, float]:
 
 
 def tv(a: dict, b: dict) -> float:
-    return 0.5 * sum(abs(a.get(o, 0.0) - b.get(o, 0.0)) for o in set(a) | set(b))
+    return 0.5 * sum(abs(a.get(o, 0.0) - b.get(o, 0.0)) for o in sorted(set(a) | set(b)))
 
 
 def changed_dims(old: dict, new: dict) -> list[str]:

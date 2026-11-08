@@ -236,7 +236,7 @@ def test_common_mode_degradation_does_not_reshuffle_caller_ids(store):
 def test_a_recovered_caller_id_is_rehabilitated(store):
     cur = {"D1": 0.32, "D2": 0.32, "D3": 0.33, "D4": 0.03}
     ctx = _did_ctx(store, {"D1": (1000, 260), "D2": (1000, 262), "D3": (1000, 258), "D4": (400, 105)}, cur)
-    store.put("did_bad:w1", {"D4": 0})
+    store.put("did_bad:w1", {"D4": {"minute": 0, "version": 1}})
     intents = plan_caller_id(ctx, -10**9)
     assert intents and intents[0].exp_update["did_bad"]["remove"] == ["D4"]
     assert intents[0].patch["allocations"]["default"]["caller_id"]["D4"] > 0.1
@@ -504,3 +504,13 @@ def test_random_interleavings_never_break_the_governance_invariants(seed):
             assert r["pid"] not in applied_ids or r["state"] in ("PENDING", "APPROVED"), f"{r['state']} proposal was applied"
     assert all(r["state"] in ("PLANNED", "PENDING", "APPROVED", "APPLIED", "REJECTED", "EXPIRED", "LAPSED", "STALE", "REFUSED", "FAILED", "ABANDONED")
                for r in rows)
+
+
+def test_recovery_ignores_dials_from_before_the_id_was_cut(store):
+    """The flagged ID's recent block mixes the period it had 84% of traffic; only calls under the cut-down config may vouch for it."""
+    cur = {"D1": 0.32, "D2": 0.32, "D3": 0.33, "D4": 0.03}
+    ctx = _did_ctx(store, {"D1": (1000, 260), "D2": (1000, 262), "D3": (1000, 258)}, cur)
+    store.run("INSERT INTO agg VALUES('w1',7,1,'default','caller_id','D4','all','',2000,520,0)")   # before the cut (version 1): looks healthy
+    store.run("INSERT INTO agg VALUES('w1',7,2,'default','caller_id','D4','all','',120,10,0)")     # after the cut (version 2): 8% pickup, only 120 dials
+    store.put("did_bad:w1", {"D4": {"minute": 0, "version": 2}})
+    assert plan_caller_id(ctx, -10**9) == []     # not enough post-cut evidence, and what there is says it is still bad

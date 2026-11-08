@@ -116,7 +116,7 @@ def apply_exp_update(store: Store, wf: str, upd: dict, version: int):
     if "did_bad" in upd:
         bad = store.get(f"did_bad:{wf}", {})
         for o in upd["did_bad"]["add"]:
-            bad[o] = store.now_minute
+            bad[o] = {"minute": store.now_minute, "version": version}  # the version boundary, not the clock, separates before from after
         for o in upd["did_bad"]["remove"]:
             bad.pop(o, None)
         store.put(f"did_bad:{wf}", bad)
@@ -147,14 +147,14 @@ def den_per_day(ctx: WfCtx) -> float:
 def replay(counts: dict, cohs: list[str], primary: str, old: dict, new: dict, ctl: str, prior: float) -> dict:
     """Dry run: expected KPI of the old vs new allocation using the *recorded* outcomes of each randomised arm."""
     rates, var, ns = {}, {}, {}
-    for o in set(old) | set(new):
+    for o in sorted(set(old) | set(new)):
         c = ev.totals({k: v for k, v in counts.items() if k[1] in cohs}, o)
         k, n = ev.kpi_of(primary, c)
         m, v = stats.beta_post(k, n, prior)
         rates[o], var[o], ns[o] = m, v, n
     e_old = sum(w * rates.get(o, 0) for o, w in old.items())
     e_new = sum(w * rates.get(o, 0) for o, w in new.items())
-    sd = math.sqrt(sum(((new.get(o, 0) - old.get(o, 0)) ** 2) * var.get(o, 0) for o in set(old) | set(new)))
+    sd = math.sqrt(sum(((new.get(o, 0) - old.get(o, 0)) ** 2) * var.get(o, 0) for o in sorted(set(old) | set(new))))
     return {"method": "replay of recorded randomised arms", "kpi": primary, "n_per_arm": ns,
             "expected_old": round(e_old, 4), "expected_new": round(e_new, 4), "delta": round(e_new - e_old, 4),
             "delta_ci95": [round(e_new - e_old - 1.96 * sd, 4), round(e_new - e_old + 1.96 * sd, 4)]}
@@ -616,8 +616,9 @@ def plan_caller_id(ctx: WfCtx, last_change_minute: int) -> list[Intent]:
     bad, notes = [], {}
     # a previously flagged ID stays at its floor until a longer window shows it back in line with its siblings
     recovered = []
-    for o, since in known_bad.items():
-        since_counts = ev.arm_counts(ctx.store, ctx.wf, "caller_id", min_blk=since // ev.BLK)
+    for o, flag in known_bad.items():
+        # recovery evidence = only calls dialled under the config that cut this ID to its floor (never the pre-flag period)
+        since_counts = ev.arm_counts(ctx.store, ctx.wf, "caller_id", min_ver=flag["version"])
         d, c, _ = ev.totals(since_counts, o)
         sib = [x for x in opts if x != o and x not in known_bad]
         sd_ = sum(ev.totals(since_counts, x)[0] for x in sib)
