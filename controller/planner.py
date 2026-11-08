@@ -640,7 +640,7 @@ def plan_caller_id(ctx: WfCtx, last_change_minute: int) -> list[Intent]:
     still_bad = [o for o in known_bad if o not in recovered]
     bad = bad + [o for o in still_bad if o not in bad]
     # An ID without enough data is unmeasured, not healthy: it stays at the probe share until it has been judged.
-    untested = [o for o in opts if o not in tested and o not in bad]
+    untested = [o for o in opts if o not in tested and o not in bad and o not in recovered]  # a recovered ID has evidence: it rejoins as measured
     healthy = [o for o in opts if o not in bad]
     if not healthy:
         return []
@@ -651,8 +651,8 @@ def plan_caller_id(ctx: WfCtx, last_change_minute: int) -> list[Intent]:
     if not keep:
         return []
     target = cfgutil.clean_dist({**{o: rest / len(keep) for o in keep}, **probe, **floor}, floor=0.0)
-    if cfgutil.tv(cur, target) < 0.08:
-        return []
+    if cfgutil.tv(cur, target) < 0.08 and not recovered:
+        return []  # (a recovery is always applied, however small the shift: otherwise the ID stays at its floor for good)
     rep = _did_replay(stat, cur, target)
     why = []
     if bad:

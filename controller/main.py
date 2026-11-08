@@ -327,10 +327,12 @@ def ensure_matching_db(path: str, key: str) -> str | None:
     try:
         db = sqlite3.connect(path)
         row = db.execute("SELECT v FROM kv WHERE k='world_key'").fetchone()
+        started = db.execute("SELECT 1 FROM kv WHERE k='started'").fetchone()
         db.close()
     except sqlite3.DatabaseError:
-        row = None
-    if row is None or json.loads(row[0]) == key:
+        row, started = None, None
+    # A DB that has run before but cannot prove which world it belongs to is not trusted either.
+    if (row is None and not started) or (row is not None and json.loads(row[0]) == key):
         return None
     dest = f"{path}.{int(time.time())}.old"
     for suffix in ("", "-wal", "-shm"):

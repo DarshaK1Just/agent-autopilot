@@ -174,9 +174,9 @@ class Incidents:
                     self.s.audit("llm_suggestions", "LLM proposed candidates (not trusted; validated below)", wf=ctx.wf,
                                  ref=inc["id"], detail=r)
                 data["llm_rounds"] += 1
-                for sug in r["suggestions"]:
-                    p = sug["prompt_version"]
-                    if p in allowed and p not in cands and len([x for x in cands if x not in last_good]) < self.pol.inc_max_new_candidates:
+                for sug in (r.get("suggestions") or []):
+                    p = sug.get("prompt_version") if isinstance(sug, dict) else None  # LLM output is untrusted: never index into it
+                    if isinstance(p, str) and p in allowed and p not in cands and len([x for x in cands if x not in last_good]) < self.pol.inc_max_new_candidates:
                         rec = self._validate(ctx, inc, data, p, n)
                         if rec:
                             cands[p] = rec
