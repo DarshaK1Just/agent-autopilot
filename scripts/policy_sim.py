@@ -48,7 +48,7 @@ def run(lifts_before: dict, lifts_after: dict | None, conn_per_day: int, seed: i
         s.run("INSERT INTO agg VALUES('w1',?,1,'default','voice','V1','all','',?,?,?)", (b, per_blk * 3, per_blk, per_blk // 2))
     lift = lambda opt, blk: (lifts_before if lifts_after is None or blk < CHANGE_BLK else lifts_after).get(opt, 0.0)
     ev = {"proposals": 0, "confirmed": None, "provisional": None, "rollback": None, "reopen": None, "new_winner": None,
-          "early_rollbacks": 0, "worse_calls": 0, "total_calls": 0, "harm_stopped": None}
+          "early_rollbacks": 0, "early_reopens": 0, "worse_calls": 0, "total_calls": 0, "harm_stopped": None}
     for blk in range(DAYS * 4):
         dist = cfgutil.dist(cfg, "default", "voice")
         for opt, share in dist.items():
@@ -84,8 +84,11 @@ def run(lifts_before: dict, lifts_after: dict | None, conn_per_day: int, seed: i
                         ev["rollback"] = blk
                     elif not post:
                         ev["early_rollbacks"] += 1
-                if i.kind == "reexplore" and post and ev["reopen"] is None:
-                    ev["reopen"] = blk
+                if i.kind == "reexplore":
+                    if post and ev["reopen"] is None:
+                        ev["reopen"] = blk
+                    elif not post:
+                        ev["early_reopens"] += 1
                 if i.kind == "harm_stop" and ev["harm_stopped"] is None:
                     ev["harm_stopped"] = blk
     return ev
