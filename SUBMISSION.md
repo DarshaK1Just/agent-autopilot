@@ -437,6 +437,7 @@ Reading the numbers: most of the gain is pickup (spreading volume across caller 
 
 ## 13. Known weaknesses
 1. **Power.** At dev scale the controller captures 6–27% of the engagement headroom; at 300 connected calls/day it declines to experiment at all; subgroup effects need more traffic than eight days provide.
+1b. **Low-volume learning was investigated and left as is.** At ~1,000 calls/day a new winner after a reopen is found in about 1% of 8-day runs because three challengers share 30% of traffic (two thirds of those samples go to arms that cannot win). Ranked/sequential probing, a faster rollback look and a cheaper reopen trigger were each measured; each traded safety (2 harmful changes in public_01, more false reopens, more approvals) for speed, so none was kept. See `reports/low_volume_experiments.md`.
 2. **A neutral winner is recognised only when there is enough data to say so.** Classifying "no longer clears the bar" needs roughly 800+ holdout trials in the window, so on a dev-scale workflow (public_01) the decayed variant stayed live to the end. At 4,000 calls/day exploration is reopened in a median of 1 day; at 1,000/day in 50% of runs inside the horizon.
 3. **Repeated looks** are covered by confirmation on independent data and a measured whole-policy error rate, not by a formal spending rule.
 4. **One partition axis**; welcome×voice interactions are not modelled.
