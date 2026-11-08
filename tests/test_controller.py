@@ -616,10 +616,13 @@ def test_winner_that_became_worse_than_its_holdout_is_rolled_back(store):
     assert cfgutil.eff(cfgutil.apply_patch(ctx.cfg, intents[0].patch), "default", "welcome_message")["W1"] >= 0.5
 
 
-def test_flat_winner_is_kept_demotion_mirrors_confirmation(store):
+def test_flat_winner_is_not_rolled_back_but_reopens_limited_exploration(store):
     from controller.planner import plan_lever
-    ctx = _promoted(store, (1000, 540), (200, 108))  # identical rates: harmless, so no approval request is spent on it
-    assert plan_lever(ctx, "welcome_message", held=False) == []
+    ctx = _promoted(store, (2000, 1080), (400, 216))  # identical rates, plenty of evidence: harmless, so no rollback ...
+    (intent,) = plan_lever(ctx, "welcome_message", held=False)
+    assert intent.kind == "reexplore" and not intent.urgent and not intent.protective   # ... but the lever is no longer frozen
+    d = intent.patch["allocations"]["default"]["welcome_message"]
+    assert d["W3"] == pytest.approx(POL.incumbent_challenge_share) and d["W1"] > 0
 
 
 def test_winner_that_still_wins_is_kept_even_if_below_its_promotion_lift(store):

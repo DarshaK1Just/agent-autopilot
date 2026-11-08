@@ -169,28 +169,37 @@ def test_healthy_winner_with_a_noisy_dip_is_kept(store):
 
 
 # ------------------------------------------------------------------- families N, O, P, Q: cohorts
-def _slice_rows(store, tot_extra, slice_conn):
+def _slice_rows(store, tot_extra, slice_conn, w2_dials=3):
+    """One 'age_band=60+' slice. slice_conn = {option: (connected, engaged)}; dials are 3x connected (33% pickup) except W2's, which
+    can be inflated to simulate a pickup collapse."""
     spec = copy.deepcopy(SPEC)
-    for opt, (conn, eng) in {"W1": (250, 100), "W2": (250, 160)}.items():
-        store.run("INSERT INTO agg VALUES('w1',5,2,'default','welcome_message',?,'age_band','60+',?,?,?)", (opt, conn * 3, slice_conn[opt][0], slice_conn[opt][1]))
-        store.run("INSERT INTO agg VALUES('w1',5,2,'default','welcome_message',?,'all','',?,?,?)", (opt, 1, conn + tot_extra, eng))
+    for opt, (conn, eng) in slice_conn.items():
+        dials = conn * (w2_dials if opt == "W2" else 3)
+        store.run("INSERT INTO agg VALUES('w1',5,2,'default','welcome_message',?,'age_band','60+',?,?,?)", (opt, dials, conn, eng))
+        store.run("INSERT INTO agg VALUES('w1',5,2,'default','welcome_message',?,'all','',?,?,?)", (opt, dials, conn + tot_extra, eng))
     return WfCtx(store, spec, copy.deepcopy(CFG), 2, 2 * 1440, 10**5, POL)
 
 
 def test_tiny_cohort_with_a_big_lift_does_not_become_a_cohort(store):
-    ctx = _slice_rows(store, tot_extra=9000, slice_conn={"W1": (250, 100), "W2": (250, 160)})  # ~5% of traffic
+    ctx = _slice_rows(store, tot_extra=15000, slice_conn={"W1": (600, 240), "W2": (600, 384)})  # ~4% of traffic
     assert _cohort_candidates(ctx, "welcome_message", {}, {"control": "W1", "start_ver": 2}, "W1", set()) == {}
 
 
 def test_sizeable_cohort_with_a_big_lift_is_provisional_not_final(store):
-    ctx = _slice_rows(store, tot_extra=100, slice_conn={"W1": (250, 100), "W2": (250, 160)})
+    ctx = _slice_rows(store, tot_extra=100, slice_conn={"W1": (600, 240), "W2": (600, 384)})
     out = _cohort_candidates(ctx, "welcome_message", {}, {"control": "W1", "start_ver": 2}, "W1", set())
     (cid, (where, dist, evd)), = out.items()
     assert where == {"age_band": ["60+"]} and dist["W2"] == pytest.approx(POL.provisional_share) and evd["hold"] == "W1"
 
 
 def test_no_useful_slice_means_no_cohort(store):
-    ctx = _slice_rows(store, tot_extra=100, slice_conn={"W1": (250, 125), "W2": (250, 127)})
+    ctx = _slice_rows(store, tot_extra=100, slice_conn={"W1": (600, 300), "W2": (600, 306)})
+    assert _cohort_candidates(ctx, "welcome_message", {}, {"control": "W1", "start_ver": 2}, "W1", set()) == {}
+
+
+def test_cohort_first_look_is_gated_on_the_guardrail_like_a_workflow_win(store):
+    # engagement +24 points in the slice, but W2's pickup collapses from 33% to 8%
+    ctx = _slice_rows(store, tot_extra=100, slice_conn={"W1": (600, 240), "W2": (600, 384)}, w2_dials=12)
     assert _cohort_candidates(ctx, "welcome_message", {}, {"control": "W1", "start_ver": 2}, "W1", set()) == {}
 
 
@@ -334,7 +343,7 @@ def test_supervisor_edit_of_the_same_lever_resets_the_experiment(store):
     ctx = _exploring(store, v2=(500, 290))
     _sup_edit(store, 3, ["voice"])
     (intent,) = plan_lever(ctx, "voice", held=False)
-    assert intent.kind == "exp_reset" and intent.evidence["supervisor_edit"] is True
+    assert intent.kind == "exp_reset" and intent.evidence["supervisor_edit_version"] == 3
 
 
 def test_supervisor_edit_of_another_dimension_keeps_the_experiment(store):
@@ -519,3 +528,76 @@ def test_urgent_fix_is_sent_when_the_fastest_approver_could_decide_in_time_but_r
     gov = Governor(store, None, POL, lambda ts: 0, lambda wf, info: 1)
     assert gov.can_submit(ctx, urgent=True)[0]           # best case 17:45 -> decided today
     assert not gov.can_submit(ctx, urgent=False)[0]      # worst case 19:15 -> tomorrow 10:00, past the 12h TTL
+
+
+# ------------------------------------------------------------------- the three-way outcome for a promoted arm (A)
+def test_stable_winner_is_left_alone(store):
+    rows = {b: ((1000, 600), (200, 100)) for b in range(2, 9)}   # +10 points, steady
+    assert plan_lever(_put_promoted(store, rows), "welcome_message", held=False) == []
+
+
+def test_neutral_winner_reopens_limited_exploration_instead_of_freezing_the_lever(store):
+    rows = {b: ((2000, 1000), (400, 200)) for b in range(2, 9)}   # the lift is gone, the arm is not worse, and there is enough data to say so
+    (intent,) = plan_lever(_put_promoted(store, rows), "welcome_message", held=False)
+    assert intent.kind == "reexplore" and not intent.protective          # a growth move: goes to the approver, not the fast path
+    state = intent.exp_update["dims"]["welcome_message"]["scopes"]["default"]
+    assert state == {"phase": "EXPLORING", "control": "W3", "start_ver": "$V"}   # the incumbent is the new control
+    d = intent.patch["allocations"]["default"]["welcome_message"]
+    assert d["W3"] == pytest.approx(POL.incumbent_challenge_share) and d["W1"] > 0 and d["W2"] > 0
+
+
+def test_after_reopening_a_new_better_arm_is_found_and_goes_through_confirmation(store):
+    cfg = copy.deepcopy(CFG)
+    cfg["allocations"]["default"]["welcome_message"] = {"W3": 0.7, "W1": 0.15, "W2": 0.15}
+    save_exp(store, "w1", "welcome_message", {"scopes": {"default": {"phase": "EXPLORING", "control": "W3", "start_ver": 3}}, "retired": {}, "dropped": {}})
+    store.run("INSERT INTO agg VALUES('w1',-5,1,'default','voice','V1','all','',6000,2000,1100)")
+    for opt, (conn, eng) in {"W3": (1400, 700), "W1": (300, 150), "W2": (300, 195)}.items():   # incumbent 50%, new arm 65%
+        store.run("INSERT INTO agg VALUES('w1',8,3,'default','welcome_message',?,'all','',?,?,?)", (opt, conn * 3, conn, eng))
+    ctx = WfCtx(store, SPEC, cfg, 3, 3 * 1440, 10**5, POL)
+    (intent,) = plan_lever(ctx, "welcome_message", held=False)
+    assert intent.kind == "promote" and intent.exp_update["dims"]["welcome_message"]["scopes"]["default"]["winner"] == "W2"
+
+
+def test_a_worse_than_holdout_winner_is_rolled_back_not_merely_reopened(store):
+    rows = {b: ((1000, 480), (200, 112)) for b in range(2, 9)}   # 48% vs 56%
+    (intent,) = plan_lever(_put_promoted(store, rows), "welcome_message", held=False)
+    assert intent.kind == "rollback" and intent.urgent
+
+
+def test_common_mode_drop_of_every_arm_does_not_trigger_any_change(store):
+    rows = {b: ((1000, 600), (200, 100)) if b < 6 else ((1000, 510), (200, 85)) for b in range(2, 9)}  # both arms fall 15% together
+    assert plan_lever(_put_promoted(store, rows), "welcome_message", held=False) == []   # contrasts are against the concurrent holdout
+
+
+# ------------------------------------------------------------------- regime-aware reset (C)
+def _two_scope_state(store, cohort_start_ver):
+    cfg = copy.deepcopy(CFG)
+    cfg["cohorts"] = [{"id": "age_band=60+", "where": {"age_band": ["60+"]}}]
+    cfg["allocations"]["default"]["voice"] = {"V1": 0.5, "V2": 0.5}      # a running exploration at workflow level
+    cfg["allocations"]["age_band=60+"] = {"voice": {"V2": 0.85, "V1": 0.15}}
+    save_exp(store, "w1", "voice", {"scopes": {"default": {"phase": "EXPLORING", "control": "V1", "start_ver": 2},
+                                                "age_band=60+": {"phase": "PROMOTED", "winner": "V2", "control": "V1", "start_ver": cohort_start_ver}},
+                                     "retired": {}, "dropped": {}})
+    store.run("INSERT INTO agg VALUES('w1',-5,1,'default','voice','V1','all','',6000,2000,1100)")
+    return WfCtx(store, SPEC, cfg, 6, 6 * 1440, 10**5, POL)
+
+
+def test_supervisor_edit_resets_only_the_scopes_that_predate_it(store):
+    ctx = _two_scope_state(store, cohort_start_ver=5)
+    _sup_edit(store, 4, ["voice"])
+    (intent,) = plan_lever(ctx, "voice", held=False)
+    assert intent.kind == "exp_reset" and intent.evidence["scopes"] == ["default"]     # the override installed after the edit survives
+
+
+def test_edit_of_another_dimension_resets_nothing(store):
+    ctx = _two_scope_state(store, cohort_start_ver=3)
+    _sup_edit(store, 4, ["schedule"])
+    assert all(i.kind != "exp_reset" for i in plan_lever(ctx, "voice", held=False))
+
+
+def test_state_of_a_deleted_cohort_is_cleaned_up_not_left_to_rot(store):
+    ctx = _two_scope_state(store, cohort_start_ver=5)
+    ctx.cfg["cohorts"] = []                                   # a supervisor deleted the cohort
+    ctx.cfg["allocations"].pop("age_band=60+")
+    (intent,) = plan_lever(ctx, "voice", held=False)
+    assert intent.kind == "exp_reset" and intent.evidence["scopes"] == ["age_band=60+"]

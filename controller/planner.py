@@ -206,17 +206,24 @@ def plan_lever(ctx: WfCtx, dim: str, held: bool) -> list[Intent]:
     cur_def = cfgutil.dist(ctx.cfg, "default", dim)
     scopes = st["scopes"]
     ds = scopes.get("default")
-    if ds:
-        start = ds["start_ver"] if isinstance(ds.get("start_ver"), int) else 0
-        edited = ctx.store.one("SELECT 1 FROM config_versions WHERE wf=? AND version>? AND actor='supervisor' AND changed_dims LIKE ?",
-                               (ctx.wf, start, f'%"{dim}"%'))
-        # the lever was rewritten under the experiment (by a supervisor, or to fewer than two options): its control and
-        # arms no longer mean what the evidence assumed -> start again from the live allocation
-        if edited or (ds["phase"] in ("EXPLORING", "CONFIRMING") and len(_kdist(cur_def)) < 2):
-            return [Intent(ctx.okey("reset", dim, ctx.version), "exp_reset", ctx.wf, (), {}, f"{dim}: experiment reset",
-                           "allocation changed externally; experiment assumptions invalid",
-                           {"allocation": cur_def, "supervisor_edit": bool(edited)},
-                           exp_update={"dims": {dim: {"scopes": {"default": None}}}})]
+    cohort_ids = {c["id"] for c in ctx.cfg["cohorts"]}
+    # Regime-aware invalidation: only scopes whose evidence began before a supervisor edit of THIS lever are reset, plus cohort
+    # scopes whose cohort no longer exists. Other levers, other dimensions and later overrides keep their evidence.
+    edit_ver = ctx.store.one("SELECT MAX(version) v FROM config_versions WHERE wf=? AND actor='supervisor' AND changed_dims LIKE ?",
+                             (ctx.wf, f'%"{dim}"%'))["v"] or 0
+    reset = set()
+    for sc, s_ in scopes.items():
+        start = s_["start_ver"] if isinstance(s_.get("start_ver"), int) else 0
+        if edit_ver > start or (sc != "default" and sc not in cohort_ids):
+            reset.add(sc)
+    # the allocation was rewritten to fewer than two options under a running test: its control and arms mean nothing now
+    if ds and ds["phase"] in ("EXPLORING", "CONFIRMING") and len(_kdist(cur_def)) < 2:
+        reset.add("default")
+    if reset:
+        return [Intent(ctx.okey("reset", dim, ctx.version, sorted(reset)), "exp_reset", ctx.wf, (), {}, f"{dim}: experiment state reset for {sorted(reset)}",
+                       "allocation or cohorts changed externally; the evidence assumed by these scopes no longer applies",
+                       {"allocation": cur_def, "supervisor_edit_version": edit_ver, "scopes": sorted(reset)},
+                       exp_update={"dims": {dim: {"scopes": {sc: None for sc in reset}}}})]
     if ds is None:
         return _start_explore(ctx, dim, st, cur_def)
     out: list[Intent] = []
@@ -224,7 +231,6 @@ def plan_lever(ctx: WfCtx, dim: str, held: bool) -> list[Intent]:
         out += _evaluate_exploring(ctx, dim, st)
     elif ds["phase"] == "CONFIRMING":
         out += _confirm(ctx, dim, st, "default")
-    cohort_ids = {c["id"] for c in ctx.cfg["cohorts"]}
     for scope, s in scopes.items():
         if scope != "default" and s.get("phase") == "CONFIRMING" and scope in cohort_ids:
             out += _confirm(ctx, dim, st, scope)
@@ -241,7 +247,7 @@ def _start_explore(ctx: WfCtx, dim: str, st: dict, cur_def: dict) -> list[Intent
     if k < 2:
         return []
     human = ctx.store.one("SELECT 1 FROM holds WHERE wf=? AND dim=? AND reason LIKE 'supervisor%'", (ctx.wf, dim)) is not None
-    base_share = pol.human_incumbent_share if human else pol.explore_control_share
+    base_share = pol.incumbent_challenge_share if human else pol.explore_control_share
     ctl_w = max(base_share, 1.0 / k)
     arm_share = (1 - ctl_w) / (k - 1)
     n_exp = den_per_day(ctx) * arm_share * ctx.days_left * 0.5
@@ -488,14 +494,16 @@ def _cohort_candidates(ctx: WfCtx, dim: str, st: dict, ds: dict, a0: str, bad_op
                     continue
                 c = ev.stratified(cv, o, a0, ctx.primary, ctx.prior)
                 if c and min(c.n_arm, c.n_ctl) >= pol.min_trials_slice:
-                    cands.append((F, v, o, c, share))
+                    cands.append((F, v, o, c, share, cv))
     if not cands:
         return {}
     need = 1.0 - pol.tail_prob / len(cands)
     best: dict = {}
-    for F, v, o, c, share in cands:
+    for F, v, o, c, share, cv in cands:
         p_win = c.p_greater(lift_bar(pol, c.rate_ctl))
         if p_win >= need and c.diff >= pol.min_cohort_gain and ((F, v) not in best or c.diff > best[(F, v)][3].diff):
+            if not guardrail_ok(ctx, cv, o, a0)[0]:   # same first-look gate as a workflow-level win
+                continue
             best[(F, v)] = (F, v, o, c, share, p_win)
     if not best:
         return {}
@@ -528,7 +536,7 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
     pol = ctx.pol
     out_patch: dict = {"allocations": {}}
     upd: dict = {}
-    reasons, evd, retired = [], {}, {}
+    reasons, evd, retired, reopen = [], {}, {}, []
     cohort_ids = {c["id"] for c in ctx.cfg["cohorts"]}
     for scope, s in st["scopes"].items():
         if s.get("phase") != "PROMOTED" or s["winner"] == s["control"] or (scope != "default" and scope not in cohort_ids):
@@ -543,6 +551,7 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
         age = ctx.blk_now - first + 1
         severe, sev_evd = _severe(ctx, _trailing_counts(ctx, dim, scope, s["start_ver"], min(2, age)), w, ctl)
         why, detail = ("severe regression", sev_evd) if severe else (None, None)
+        neutral = False
         if not severe:
             for k in sorted({k for k in (4, 6, 8, 12, 16, 24, 32, 48, 64, 96, age) if pol.decay_min_blocks <= k <= age}):
                 counts = _trailing_counts(ctx, dim, scope, s["start_ver"], k)
@@ -560,8 +569,24 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
                     why = "guardrail breached"
                 elif p_still <= 1 - pol.confirm_prob:   # mirror of confirmation: demote only on equally strong evidence against
                     why = f"no longer better than its holdout (P(better)={p_still:.2f})"
+                else:
+                    detail["p_clears_practical_lift"] = round(cr.p_greater(lift_bar(pol, cr.rate_ctl)), 3)
+                    neutral = detail["p_clears_practical_lift"] <= pol.decay_p   # not worse, but no longer worth its place
                 break
         evd[scope] = detail
+        if neutral and not why and scope == "default":
+            # still beneficial -> keep; harmful/worse -> roll back (below); NO LONGER BENEFICIAL -> keep serving the incumbent but
+            # reopen limited exploration, so a better arm (or the old control) can be found. Cheap if wrong: a 30% challenge.
+            live = [o for o in ctx.spec["options"][dim] if o != w and o not in _dropped(st)]
+            if live:
+                dist = cfgutil.clean_dist({w: pol.incumbent_challenge_share, **{o: (1 - pol.incumbent_challenge_share) / len(live) for o in live}})
+                reopen.append(Intent(ctx.okey("reexplore", dim, w), "reexplore", ctx.wf, (dim,), {"allocations": {"default": {dim: dist}}},
+                                     f"Reopen limited exploration of {dim}: promoted {w} is no longer clearly better than its holdout",
+                                     f"Over the last {detail['window_blocks']} blocks {w} no longer clears the practical bar "
+                                     f"(P={detail['p_clears_practical_lift']:.2f}) but is not worse than the control; keeping it at "
+                                     f"{pol.incumbent_challenge_share:.0%} and testing the other options at the rest.",
+                                     {"default": detail}, confidence=0.6,
+                                     exp_update={"dims": {dim: {"scopes": {"default": {"phase": "EXPLORING", "control": w, "start_ver": "$V"}}}}}))
         if why:
             patch, new_state, extra = _withdraw_patch(ctx, dim, st, scope, w, ctl)
             out_patch["allocations"].update(patch["allocations"])
@@ -570,8 +595,8 @@ def _watch_decay(ctx: WfCtx, dim: str, st: dict) -> list[Intent]:
                 retired[w] = ctx.minute
             reasons.append(f"{dim}={w} in {scope}: {why}")
     if not reasons:
-        return []
-    return [Intent(ctx.okey("rollback", dim, sorted(upd)), "rollback", ctx.wf, (dim,), out_patch,
+        return reopen
+    return reopen + [Intent(ctx.okey("rollback", dim, sorted(upd)), "rollback", ctx.wf, (dim,), out_patch,
                    "Roll back: " + "; ".join(reasons),
                    "A promoted arm stopped beating its holdout (or regressed); reverting to the control and re-exploring.",
                    evd, protective=True, urgent=True, confidence=0.8, expected_rel_lift=0.02,

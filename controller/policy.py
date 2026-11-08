@@ -6,7 +6,7 @@ from dataclasses import dataclass
 class Policy:
     # --- experiments
     explore_control_share: float = 0.4     # D: incumbent keeps >= 40% so the control arm is never starved
-    human_incumbent_share: float = 0.7     # D: a supervisor-chosen incumbent is challenged with <= 30% (prior favours a human's choice)
+    incumbent_challenge_share: float = 0.7 # D: an incumbent with a record (a supervisor's choice, or a promoted winner that stopped improving) is challenged with <= 30%
     provisional_share: float = 0.5         # D: a first-look winner gets half the traffic until fresh data confirms it
     confirm_prob: float = 0.90             # D: fresh-data P(winner better than control) needed to confirm (one pre-specified test)
     holdout_share: float = 0.15            # B: promoted winner keeps 15% on the control so decay stays measurable
